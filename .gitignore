@@ -1,0 +1,22 @@
+# Dependencies & virtual environments
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Build output
+dist/
+
+# Secrets & local credentials
+.env
+.env.*
+*.pem
+*.key
+*service-account*.json
+*credentials*.json
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+*.log

@@ -1,0 +1,5 @@
+{
+  "description": "ArmorCept DLP and Prompt Injection Firewall hooks for Claude Code",
+  "modules": ["./register.ts"],
+  "hooks": {}
+}
