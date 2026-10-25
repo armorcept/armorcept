@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "armorcept",
+  "owner": {
+    "name": "ArmorCept Security"
+  },
+  "description": "Hybrid local (prompt-armor) and enterprise cloud (Google Cloud Model Armor) DLP & prompt injection firewall for Claude Code.",
+  "plugins": [
+    {
+      "name": "armorcept",
+      "source": "./",
+      "description": "Deterministic client-side DLP and prompt injection security mod for Claude Code combining local prompt-armor and Google Cloud Model Armor.",
+      "version": "0.1.0",
+      "license": "Apache-2.0",
+      "keywords": [
+        "security",
+        "dlp",
+        "prompt-injection",
+        "jailbreak",
+        "model-armor",
+        "prompt-armor",
+        "firewall"
+      ]
+    }
+  ]
+}

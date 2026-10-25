@@ -10,6 +10,38 @@ ArmorCept combines a fast local open-source analysis engine ([prompt-armor](http
 - **`CLOUD`**: Routes all intercepted payloads directly to the Google Cloud Model Armor `sanitizeUserPrompt` REST API.
 - **`WATERFALL`** *(Default)*: Executes `prompt-armor` locally first (`council.enabled = False`), immediately blocking obvious attacks (`risk_score >= WATERFALL_BLOCK_ABOVE`), escalating uncertain payloads (`WATERFALL_ALLOW_BELOW <= risk_score < WATERFALL_BLOCK_ABOVE` or `confidence < WATERFALL_MIN_CONFIDENCE`) to Google Cloud Model Armor, and optionally enforcing cloud DLP on locally-cleared payloads (`WATERFALL_ALWAYS_RUN_CLOUD_DLP=true`).
 
+## Installation
+
+### Option 1: Install via Claude Code Plugin Marketplace (Recommended)
+
+```bash
+# Install directly from GitHub
+claude plugin install armorcept --marketplace armorcept/armorcept
+```
+
+Or inside an interactive Claude Code session:
+
+```text
+/plugin marketplace add armorcept/armorcept
+/plugin install armorcept
+```
+
+### Option 2: Auto-Load via `~/.claude/skills/` (With Local `prompt-armor` Virtualenv)
+
+```bash
+git clone https://github.com/armorcept/armorcept.git ~/.claude/skills/armorcept
+cd ~/.claude/skills/armorcept
+python3 -m venv .venv
+.venv/bin/pip install -r python/requirements.txt
+```
+
+### Option 3: Per-Session Load (`--plugin-dir`)
+
+```bash
+git clone https://github.com/armorcept/armorcept.git
+claude --plugin-dir ./armorcept
+```
+
 ## Configuration (`.claude/settings.json`)
 
 ```json
