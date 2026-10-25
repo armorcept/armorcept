@@ -35,5 +35,9 @@
   "engines": {
     "node": ">=18.0.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/armorcept/armorcept.git"
+  },
   "license": "Apache-2.0"
 }

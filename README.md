@@ -4,7 +4,7 @@
 
 ## Architecture & Modes
 
-ArmorCept combines a fast local open-source analysis engine (`prompt-armor`, `< 30ms` inference with Ollama council disabled) with enterprise cloud DLP and safety scanning (**Google Cloud Model Armor**):
+ArmorCept combines a fast local open-source analysis engine ([prompt-armor](https://github.com/prompt-armor/prompt-armor), `< 30ms` inference with Ollama council disabled) with enterprise cloud DLP and safety scanning ([Google Cloud Model Armor](https://cloud.google.com/security-command-center/docs/model-armor-overview)):
 
 - **`LOCAL`**: Routes all intercepted payloads strictly to a local warm `prompt-armor` worker. Zero API cost, offline-capable, `< 30ms` latency.
 - **`CLOUD`**: Routes all intercepted payloads directly to the Google Cloud Model Armor `sanitizeUserPrompt` REST API.
@@ -45,3 +45,13 @@ npm run build
 # Run automated unit and integration tests
 npm test
 ```
+
+## Acknowledgments
+
+- **[prompt-armor](https://github.com/prompt-armor/prompt-armor)** ([PyPI](https://pypi.org/project/prompt-armor/), `Apache-2.0`) by the prompt-armor contributors — powers ArmorCept's local 5-layer prompt injection and jailbreak analysis pipeline.
+- **[Google Cloud Model Armor](https://cloud.google.com/security-command-center/docs/model-armor-overview)** — powers ArmorCept's enterprise cloud sanitization, Responsible AI (RAI), and Sensitive Data Protection (SDP/DLP) enforcement.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](./LICENSE).
+
