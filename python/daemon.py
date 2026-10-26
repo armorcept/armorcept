@@ -2,17 +2,19 @@
 """
 ArmorCept Local Prompt-Armor Worker Daemon.
 
-Keeps the prompt-armor 5-layer pipeline warm in memory (with council.enabled = False)
-to achieve < 30ms local evaluation latency without Python cold-start overhead.
+Keeps the prompt-armor pipeline warm in memory (with council.enabled = False)
+to avoid per-event Python cold-start overhead.
 
 Supports two transport modes:
 1. stdio (default): Reads newline-delimited JSON requests from stdin and writes JSON responses to stdout.
-2. http: Starts a lightweight local HTTP server listening on 127.0.0.1:8443/analyze.
+2. http: Starts a local HTTP server listening on 127.0.0.1:<port>/analyze (supports --port 0 for ephemeral port assignment
+   and optional ARMORCEPT_DAEMON_TOKEN authentication via the X-ArmorCept-Token header).
 """
 
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import re
@@ -39,7 +41,7 @@ class WarmPromptArmorEngine:
             import prompt_armor  # type: ignore
 
             # Prevent L2ClassifierLayer from attempting to download the removed
-            # private HuggingFace repo (aldenb/scout-prompt-injection-classifier-22m)
+            # upstream HuggingFace repo (aldenb/scout-prompt-injection-classifier-22m)
             try:
                 from prompt_armor.layers.l2_classifier import L2ClassifierLayer  # type: ignore
 
@@ -140,17 +142,22 @@ class WarmPromptArmorEngine:
     def _merge_local_dlp(self, result: Dict[str, Any], text: str) -> Dict[str, Any]:
         dlp_hits = self._scan_local_dlp(text)
         if not dlp_hits:
+            result["dlp_categories"] = []
             return result
         categories = list(result.get("categories", []))
+        dlp_categories: List[str] = []
         max_risk = float(result.get("risk_score", 0.0))
         confidence = float(result.get("confidence", 1.0))
         for category, risk, conf, _ in dlp_hits:
+            if category not in dlp_categories:
+                dlp_categories.append(category)
             if category not in categories:
                 categories.append(category)
             if risk > max_risk:
                 max_risk = risk
                 confidence = conf
         result["categories"] = categories
+        result["dlp_categories"] = dlp_categories
         result["risk_score"] = max_risk
         result["confidence"] = confidence
         if max_risk >= 0.75:
@@ -167,6 +174,7 @@ class WarmPromptArmorEngine:
                 "categories": [
                     str(c).replace("Category.", "") for c in raw.get("categories", [])
                 ],
+                "dlp_categories": [],
                 "evidence": raw.get("evidence", {}),
                 "latency_ms": float(raw.get("latency_ms", elapsed_ms)),
                 "council_enabled": False,
@@ -182,7 +190,10 @@ class WarmPromptArmorEngine:
             "Decision.", ""
         )
         evidence_raw = getattr(raw, "evidence", {})
-        if not isinstance(evidence_raw, (dict, list, str, int, float, bool)) and evidence_raw is not None:
+        if (
+            not isinstance(evidence_raw, (dict, list, str, int, float, bool))
+            and evidence_raw is not None
+        ):
             evidence_raw = str(evidence_raw)
 
         return {
@@ -190,6 +201,7 @@ class WarmPromptArmorEngine:
             "confidence": float(getattr(raw, "confidence", 1.0)),
             "decision": decision,
             "categories": categories,
+            "dlp_categories": [],
             "evidence": evidence_raw or {},
             "latency_ms": float(getattr(raw, "latency_ms", elapsed_ms)),
             "council_enabled": False,
@@ -198,7 +210,7 @@ class WarmPromptArmorEngine:
 
     def _fallback_analyze(self, text: str, start_ns: int) -> Dict[str, Any]:
         """Deterministic fast local regex/semantic fallback when prompt-armor package is unavailable."""
-        patterns = [
+        injection_patterns = [
             (
                 r"(?i)\b(ignore|disregard|forget)\s+(all\s+)?(previous|prior|above|system)\s+(instructions|prompts|rules|directives)",
                 "PROMPT_INJECTION",
@@ -217,42 +229,6 @@ class WarmPromptArmorEngine:
                 0.88,
                 0.90,
             ),
-            (
-                r"\b(AKIA|ASIA)[0-9A-Z]{16}\b",
-                "SECRET_LEAK_AWS_ACCESS_KEY",
-                0.96,
-                0.98,
-            ),
-            (
-                r"\b(ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,})\b",
-                "SECRET_LEAK_GITHUB_TOKEN",
-                0.97,
-                0.98,
-            ),
-            (
-                r"\bsk-(ant-api03-[A-Za-z0-9\-_]{20,}|proj-[A-Za-z0-9\-_]{20,}|[A-Za-z0-9]{32,})\b",
-                "SECRET_LEAK_API_KEY",
-                0.96,
-                0.98,
-            ),
-            (
-                r"\bAIza[0-9A-Za-z\-_]{35}\b",
-                "SECRET_LEAK_GCP_API_KEY",
-                0.95,
-                0.97,
-            ),
-            (
-                r"-----BEGIN (RSA |EC |OPENSSH |DSA |PRIVATE )?PRIVATE KEY-----",
-                "SECRET_LEAK_PRIVATE_KEY",
-                0.98,
-                0.99,
-            ),
-            (
-                r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b",
-                "DLP_US_SSN",
-                0.91,
-                0.93,
-            ),
         ]
 
         matched_categories: List[str] = []
@@ -260,13 +236,25 @@ class WarmPromptArmorEngine:
         max_risk = 0.05
         confidence = 0.94
 
-        for regex, category, risk, conf in patterns:
+        for regex, category, risk, conf in injection_patterns:
             if re.search(regex, text):
                 matched_categories.append(category)
                 matched_rules.append(regex)
                 if risk > max_risk:
                     max_risk = risk
                     confidence = conf
+
+        dlp_hits = self._scan_local_dlp(text)
+        dlp_categories: List[str] = []
+        for category, risk, conf, regex in dlp_hits:
+            if category not in dlp_categories:
+                dlp_categories.append(category)
+            if category not in matched_categories:
+                matched_categories.append(category)
+            matched_rules.append(regex)
+            if risk > max_risk:
+                max_risk = risk
+                confidence = conf
 
         elapsed_ms = round((time.perf_counter_ns() - start_ns) / 1_000_000, 2)
         decision = "BLOCK" if max_risk >= 0.75 else "ALLOW"
@@ -276,6 +264,7 @@ class WarmPromptArmorEngine:
             "confidence": confidence,
             "decision": decision,
             "categories": matched_categories,
+            "dlp_categories": dlp_categories,
             "evidence": {
                 "layer": "regex_fast_path",
                 "matched_rules": matched_rules,
@@ -316,7 +305,8 @@ def run_stdio_daemon(engine: WarmPromptArmorEngine) -> None:
 
 
 def run_http_daemon(engine: WarmPromptArmorEngine, host: str, port: int) -> None:
-    """Lightweight HTTP server for PROMPT_ARMOR_ENDPOINT=http://127.0.0.1:8443/analyze."""
+    """Lightweight HTTP server for PROMPT_ARMOR_ENDPOINT=http://127.0.0.1:<port>/analyze."""
+    expected_token = os.environ.get("ARMORCEPT_DAEMON_TOKEN", "").strip()
 
     class AnalyzeHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802
@@ -324,6 +314,19 @@ def run_http_daemon(engine: WarmPromptArmorEngine, host: str, port: int) -> None
                 self.send_response(404)
                 self.end_headers()
                 return
+
+            if expected_token:
+                provided = self.headers.get("X-ArmorCept-Token", "")
+                if not hmac.compare_digest(provided, expected_token):
+                    err_bytes = json.dumps({"error": "Unauthorized daemon request"}).encode(
+                        "utf-8"
+                    )
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err_bytes)))
+                    self.end_headers()
+                    self.wfile.write(err_bytes)
+                    return
 
             content_length = int(self.headers.get("Content-Length", "0"))
             raw_body = self.rfile.read(content_length).decode("utf-8")
@@ -351,15 +354,27 @@ def run_http_daemon(engine: WarmPromptArmorEngine, host: str, port: int) -> None
             # Silence standard HTTP request logs to keep daemon output clean
             return
 
-    # Pre-warm the 5-layer pipeline on daemon startup so the first HTTP request is sub-25ms
+    # Pre-warm the pipeline on daemon startup before advertising readiness
     warmup = engine.analyze("warmup")
     mode_label = warmup.get("engine_mode", "full")
+
+    server = HTTPServer((host, port), AnalyzeHandler)
+    actual_port = int(server.server_port)
+
+    ready_msg = {
+        "ready": True,
+        "host": host,
+        "port": actual_port,
+        "engine_mode": mode_label,
+    }
+    sys.stdout.write(json.dumps(ready_msg) + "\n")
+    sys.stdout.flush()
+
     sys.stderr.write(
-        f"🛡️ ArmorCept Warm Prompt-Armor Daemon listening on http://{host}:{port}/analyze (engine_mode={mode_label})\n"
+        f"🛡️ ArmorCept Warm Prompt-Armor Daemon listening on http://{host}:{actual_port}/analyze (engine_mode={mode_label})\n"
     )
     sys.stderr.flush()
 
-    server = HTTPServer((host, port), AnalyzeHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -375,7 +390,12 @@ def main() -> None:
         help="Transport mode: stdio (default) or http",
     )
     parser.add_argument("--host", default="127.0.0.1", help="HTTP bind host")
-    parser.add_argument("--port", type=int, default=8443, help="HTTP bind port")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8443,
+        help="HTTP bind port (pass 0 for an OS-assigned ephemeral port)",
+    )
     args = parser.parse_args()
 
     engine = WarmPromptArmorEngine()

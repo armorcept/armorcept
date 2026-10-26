@@ -1,7 +1,8 @@
 {
   "name": "armorcept",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Hybrid local (prompt-armor) and enterprise cloud (Google Cloud Model Armor) DLP & prompt injection firewall for Claude Code",
+  "icon": ".claude-plugin/icon.png",
   "license": "Apache-2.0",
   "repository": "https://github.com/armorcept/armorcept",
   "author": {

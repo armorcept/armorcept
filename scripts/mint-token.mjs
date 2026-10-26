@@ -37,7 +37,7 @@ function postForm(urlString, params) {
           if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
             try {
               resolve(JSON.parse(text));
-            } catch (e) {
+            } catch {
               reject(new Error(`Invalid JSON from token endpoint: ${text}`));
             }
           } else {
@@ -55,6 +55,9 @@ function postForm(urlString, params) {
 }
 
 async function main() {
+  const allowAdcFallback =
+    (process.env.ARMORCEPT_ALLOW_GCLOUD_ADC || '').trim().toLowerCase() === 'true';
+
   let keyFile = process.argv[2] || process.env.GOOGLE_APPLICATION_CREDENTIALS || '';
   keyFile = keyFile.trim().replace(/^["']|["']$/g, '');
 
@@ -69,7 +72,7 @@ async function main() {
     keyFile = `/mnt/${drive}${rest}`;
   }
 
-  if (!keyFile) {
+  if (!keyFile && allowAdcFallback) {
     const defaultAdc = path.join(
       os.homedir(),
       '.config',
@@ -83,7 +86,7 @@ async function main() {
 
   if (!keyFile) {
     throw new Error(
-      'GOOGLE_APPLICATION_CREDENTIALS is not set in the Claude Code environment and no default ADC file was found.'
+      'GOOGLE_APPLICATION_CREDENTIALS is not set (set GOOGLE_APPLICATION_CREDENTIALS, or set ARMORCEPT_ALLOW_GCLOUD_ADC=true to allow default gcloud ADC credentials).'
     );
   }
 
@@ -123,11 +126,20 @@ async function main() {
     if (!tokenResp.access_token) {
       throw new Error(`No access_token in response: ${JSON.stringify(tokenResp)}`);
     }
-    process.stdout.write(tokenResp.access_token);
+    const expiresInSec = Number(tokenResp.expires_in) || 3600;
+    process.stdout.write(
+      JSON.stringify({
+        access_token: tokenResp.access_token,
+        expires_in: expiresInSec,
+      })
+    );
     return;
   }
 
-  if (creds.type === 'authorized_user' || (creds.client_id && creds.client_secret && creds.refresh_token)) {
+  if (
+    creds.type === 'authorized_user' ||
+    (creds.client_id && creds.client_secret && creds.refresh_token)
+  ) {
     const tokenUri = creds.token_uri || 'https://oauth2.googleapis.com/token';
     const tokenResp = await postForm(tokenUri, {
       client_id: creds.client_id,
@@ -139,7 +151,13 @@ async function main() {
     if (!tokenResp.access_token) {
       throw new Error(`No access_token in response: ${JSON.stringify(tokenResp)}`);
     }
-    process.stdout.write(tokenResp.access_token);
+    const expiresInSec = Number(tokenResp.expires_in) || 3600;
+    process.stdout.write(
+      JSON.stringify({
+        access_token: tokenResp.access_token,
+        expires_in: expiresInSec,
+      })
+    );
     return;
   }
 

@@ -1,1 +1,16 @@
-prompt-armor>=0.1.0
+# Pinned runtime dependencies for ArmorCept local prompt-armor daemon
+prompt-armor==0.9.1
+onnxruntime==1.31.0
+faiss-cpu==1.15.1
+tokenizers==0.23.3
+huggingface-hub==2.2.0
+pydantic==2.14.1
+pydantic-core==2.50.1
+numpy==2.5.4
+scipy==1.18.1
+scikit-learn==1.9.1
+pyyaml==6.0.3
+regex==2026.9.29
+tqdm==4.70.1
+click==8.5.0
+rich==15.0.0
