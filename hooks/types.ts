@@ -44,7 +44,12 @@ export interface PromptArmorResult {
 
 export interface EvaluationVerdict {
   decision: 'ALLOW' | 'WARN' | 'BLOCK';
-  source: 'Prompt-Armor' | 'Model Armor' | 'ArmorCept';
+  source:
+    | 'Prompt-Armor'
+    | 'ArmorCept Built-in'
+    | 'ArmorCept DLP'
+    | 'Model Armor'
+    | 'ArmorCept';
   mode: ArmorCeptMode;
   reason: string;
   findings: string[];

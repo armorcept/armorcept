@@ -22,6 +22,21 @@ const MAX_CLOUD_SCAN_CHUNK_CHARS = 32_768;
 const CHUNK_OVERLAP_CHARS = 512;
 const MAX_TOTAL_SCAN_CHARS = 524_288;
 
+// prompt-armor only produces the result in full mode, and even then the DLP
+// and secret findings come from ArmorCept's own patterns merged in by the daemon.
+export function localVerdictSource(
+  local: PromptArmorResult
+): EvaluationVerdict['source'] {
+  if (local.engine_mode === 'lightweight_fallback') {
+    return 'ArmorCept Built-in';
+  }
+  const isPureDlpHit =
+    local.dlpCategories.length > 0 &&
+    local.findings.length > 0 &&
+    local.findings.every((f) => local.dlpCategories.includes(f));
+  return isPureDlpHit ? 'ArmorCept DLP' : 'Prompt-Armor';
+}
+
 export function evaluateLocalVerdict(
   local: PromptArmorResult,
   cfg: RuntimeConfig
@@ -36,7 +51,7 @@ export function evaluateLocalVerdict(
     if (cfg.localDlpAction === 'allow') {
       return {
         decision: 'ALLOW',
-        source: 'Prompt-Armor',
+        source: localVerdictSource(local),
         mode: 'LOCAL',
         reason: `Local DLP match allowed by ARMORCEPT_LOCAL_DLP_ACTION=allow (${primaryDlp})`,
         findings: local.findings,
@@ -49,7 +64,7 @@ export function evaluateLocalVerdict(
     if (cfg.localDlpAction === 'warn') {
       return {
         decision: 'WARN',
-        source: 'Prompt-Armor',
+        source: localVerdictSource(local),
         mode: 'LOCAL',
         reason: primaryDlp,
         findings: local.findings,
@@ -69,7 +84,7 @@ export function evaluateLocalVerdict(
       `Local threat score ${local.score.toFixed(2)} exceeded threshold`;
     return {
       decision: 'BLOCK',
-      source: 'Prompt-Armor',
+      source: localVerdictSource(local),
       mode: 'LOCAL',
       reason,
       findings: local.findings.length > 0 ? local.findings : [reason],
@@ -90,7 +105,7 @@ export function evaluateLocalVerdict(
       `Elevated local risk score ${local.score.toFixed(2)}`;
     return {
       decision: 'WARN',
-      source: 'Prompt-Armor',
+      source: localVerdictSource(local),
       mode: 'LOCAL',
       reason,
       findings: local.findings.length > 0 ? local.findings : [reason],
@@ -103,9 +118,9 @@ export function evaluateLocalVerdict(
 
   return {
     decision: 'ALLOW',
-    source: 'Prompt-Armor',
+    source: localVerdictSource(local),
     mode: 'LOCAL',
-    reason: 'Clean payload verified by local Prompt-Armor',
+    reason: `Clean payload verified by local ${localVerdictSource(local)}`,
     findings: local.findings,
     score: local.score,
     confidence: local.confidence,
@@ -228,7 +243,7 @@ async function evaluateText(
       )}, confidence: ${local.confidence.toFixed(2)})`;
     return {
       decision: 'BLOCK',
-      source: 'Prompt-Armor',
+      source: localVerdictSource(local),
       mode: 'WATERFALL',
       reason,
       findings: local.findings.length > 0 ? local.findings : [reason],
@@ -248,7 +263,7 @@ async function evaluateText(
   if (lowRiskAndConfident && !cfg.waterfallAlwaysRunCloudDlp) {
     return {
       decision: 'ALLOW',
-      source: 'Prompt-Armor',
+      source: localVerdictSource(local),
       mode: 'WATERFALL',
       reason: 'Fast-path local ALLOW (low risk, high confidence)',
       findings: local.findings,

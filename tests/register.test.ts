@@ -242,6 +242,21 @@ describe('ArmorCept — Pure Configuration & Parsing Unit Tests', () => {
     const allowCfg = buildRuntimeConfig({ ARMORCEPT_LOCAL_DLP_ACTION: 'allow' });
     expect(evaluateLocalVerdict(dlpHit, allowCfg).decision).toBe('ALLOW');
 
+    // Verdict source names the engine that produced the finding
+    expect(evaluateLocalVerdict(dlpHit, blockCfg).source).toBe('ArmorCept DLP');
+    expect(
+      evaluateLocalVerdict(
+        { ...dlpHit, engine_mode: 'lightweight_fallback' as const },
+        blockCfg
+      ).source
+    ).toBe('ArmorCept Built-in');
+    expect(
+      evaluateLocalVerdict(
+        { ...dlpHit, findings: ['JAILBREAK_ATTEMPT'], dlpCategories: [] },
+        blockCfg
+      ).source
+    ).toBe('Prompt-Armor');
+
     // Mixed DLP + Prompt Injection must still BLOCK even when localDlpAction is allow
     const mixedHit = {
       score: 0.95,
