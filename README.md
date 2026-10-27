@@ -23,6 +23,18 @@ Because ArmorCept inspects user prompts, tool arguments, and (optionally) tool o
 | **`WATERFALL`** (`WATERFALL_ALWAYS_RUN_CLOUD_DLP=true`, default) | Locally blocked (`BLOCK`) payloads stay on the host. All other non-exempt prompts, tool arguments, and (when `ARMORCEPT_SCAN_TOOL_RESULTS=true`) tool outputs are sent to your Google Cloud project's regional Model Armor endpoint for SDP/DLP and safety inspection. |
 | **`CLOUD`** | All non-exempt prompts, tool arguments, and (when `ARMORCEPT_SCAN_TOOL_RESULTS=true`) tool outputs are sent to your Google Cloud project's regional Model Armor endpoint. |
 
+## What ArmorCept Accesses
+
+- **Hooks**: `session.start`, `prompt.submit` and `tool.call`. It can block a prompt or tool call, and withholds tool output when `ARMORCEPT_SCAN_TOOL_RESULTS=true`.
+- **Processes**: starts `python/daemon.py` (a localhost-only HTTP worker, or one-shot `stdio`). In `CLOUD`/`WATERFALL` mode it runs `scripts/mint-token.mjs` with `node` to mint an OAuth2 access token, which calls `gcloud` only when `ARMORCEPT_ALLOW_GCLOUD_ADC=true`.
+- **Network**: `127.0.0.1` for the local worker. In `CLOUD`/`WATERFALL` mode it also contacts your regional Model Armor endpoint and Google OAuth (see [Data Privacy & Network Flows](#data-privacy--network-flows)).
+- **Files and settings**: reads its own environment variables, the settings files, and the service account key at `GOOGLE_APPLICATION_CREDENTIALS`. It writes nothing outside the plugin directory.
+
+## Requirements
+
+- Claude Code with function hooks (tested on 2.1.311, where they are on by default and `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS` is not needed). If your build ships with function hooks turned off, set `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`.
+- Python 3 on `PATH`. Without `prompt-armor` installed, ArmorCept uses its built-in regex and heuristic engine.
+
 ## Installation
 
 ### Option 1: Install via Claude Code Plugin Marketplace (Recommended)
@@ -37,6 +49,16 @@ Or inside an interactive Claude Code session:
 /plugin marketplace add armorcept/armorcept
 /plugin install armorcept
 ```
+
+A marketplace install does not create the Python environment, so scans use the built-in engine. To enable the full `prompt-armor` engine, create the virtual environment inside the installed plugin folder:
+
+```bash
+cd ~/.claude/plugins/cache/armorcept/armorcept/0.2.1
+python3 -m venv .venv
+.venv/bin/pip install -r python/requirements.txt
+```
+
+The folder is versioned, so repeat this after updating the plugin.
 
 ### Option 2: Load from a Local Clone (`--plugin-dir` or `CLAUDE_CODE_PLUGIN_DIRS`)
 
