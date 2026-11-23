@@ -21,16 +21,152 @@ import re
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from dataclasses import dataclass
 from typing import Any, Dict, List
 
 # Avoid slow outbound HuggingFace Hub checks during local offline startup
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 
+@dataclass(frozen=True)
+class DlpPattern:
+    category: str
+    regex: "re.Pattern[str]"
+    risk: float
+    confidence: float
+
+
+# Token bodies often end in "-" or "_", where \b does not hold, so the end of a
+# token is "not followed by another token character" instead.
+_TOKEN_END = r"(?![A-Za-z0-9_\-])"
+
+
+def _builtin(regex: str, category: str, risk: float, confidence: float) -> DlpPattern:
+    return DlpPattern(category, re.compile(regex), risk, confidence)
+
+
+BUILTIN_DLP_PATTERNS: List[DlpPattern] = [
+    _builtin(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b", "SECRET_LEAK_AWS_ACCESS_KEY", 0.96, 0.98),
+    _builtin(
+        r"\b(gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,})\b",
+        "SECRET_LEAK_GITHUB_TOKEN",
+        0.97,
+        0.98,
+    ),
+    # Anthropic API keys (sk-ant-api03-), OAuth tokens (sk-ant-oat01-, used by
+    # CLAUDE_CODE_OAUTH_TOKEN) and admin keys (sk-ant-admin01-).
+    _builtin(
+        r"\bsk-ant-[a-z]{3,5}\d{2}-[A-Za-z0-9_\-]{20,}" + _TOKEN_END,
+        "SECRET_LEAK_ANTHROPIC_KEY",
+        0.97,
+        0.98,
+    ),
+    _builtin(
+        r"\bsk-(proj-[A-Za-z0-9_\-]{20,}|[A-Za-z0-9]{32,})" + _TOKEN_END,
+        "SECRET_LEAK_API_KEY",
+        0.96,
+        0.98,
+    ),
+    _builtin(r"\bAIza[0-9A-Za-z_\-]{35}" + _TOKEN_END, "SECRET_LEAK_GCP_API_KEY", 0.95, 0.97),
+    _builtin(
+        r"\bxox[abprs]-[A-Za-z0-9]{8,}(-[A-Za-z0-9]{4,})+" + _TOKEN_END,
+        "SECRET_LEAK_SLACK_TOKEN",
+        0.96,
+        0.98,
+    ),
+    _builtin(r"\b[rs]k_live_[A-Za-z0-9]{24,}\b", "SECRET_LEAK_STRIPE_KEY", 0.97, 0.98),
+    _builtin(r"\bnpm_[A-Za-z0-9]{36}\b", "SECRET_LEAK_NPM_TOKEN", 0.96, 0.98),
+    # Matches the header line only, so it also catches keys embedded in JSON
+    # (service-account files) where the newlines are escaped as \n.
+    _builtin(
+        r"-----BEGIN (RSA |EC |OPENSSH |DSA |ENCRYPTED |PRIVATE )?PRIVATE KEY-----",
+        "SECRET_LEAK_PRIVATE_KEY",
+        0.98,
+        0.99,
+    ),
+    _builtin(
+        r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b", "DLP_US_SSN", 0.91, 0.93
+    ),
+]
+
+MAX_EXTRA_PATTERNS = 200
+MAX_EXTRA_REGEX_CHARS = 1000
+_EXTRA_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
+
+
+class PatternConfigError(ValueError):
+    """Raised when the ARMORCEPT_EXTRA_PATTERNS file cannot be used."""
+
+
+def load_extra_patterns(path: str) -> List[DlpPattern]:
+    """Loads and validates a JSON list of {name, regex, risk[, confidence]} entries.
+
+    The file may be a bare list or an object with a "patterns" list. Any problem
+    raises PatternConfigError naming the entry; the regex text is never echoed.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError as exc:
+        raise PatternConfigError(f"file not found: {path}") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PatternConfigError(f"cannot read {path}: {exc.__class__.__name__}") from exc
+    except json.JSONDecodeError as exc:
+        raise PatternConfigError(f"invalid JSON in {path} (line {exc.lineno})") from exc
+
+    entries = raw.get("patterns") if isinstance(raw, dict) else raw
+    if not isinstance(entries, list):
+        raise PatternConfigError('expected a JSON list or {"patterns": [...]}')
+    if len(entries) > MAX_EXTRA_PATTERNS:
+        raise PatternConfigError(f"too many patterns ({len(entries)} > {MAX_EXTRA_PATTERNS})")
+
+    patterns: List[DlpPattern] = []
+    seen: set[str] = set()
+    for idx, entry in enumerate(entries):
+        label = f"entry {idx}"
+        if not isinstance(entry, dict):
+            raise PatternConfigError(f"{label}: expected an object")
+        name = entry.get("name")
+        if not isinstance(name, str) or not _EXTRA_NAME_RE.match(name):
+            raise PatternConfigError(
+                f"{label}: name must be 3-64 chars of A-Z, 0-9 and _, starting with a letter"
+            )
+        label = f'entry {idx} ("{name}")'
+        if name in seen:
+            raise PatternConfigError(f"{label}: duplicate name")
+        seen.add(name)
+        regex = entry.get("regex")
+        if not isinstance(regex, str) or not regex:
+            raise PatternConfigError(f"{label}: regex must be a non-empty string")
+        if len(regex) > MAX_EXTRA_REGEX_CHARS:
+            raise PatternConfigError(f"{label}: regex longer than {MAX_EXTRA_REGEX_CHARS} chars")
+        try:
+            compiled = re.compile(regex)
+        except re.error as exc:
+            raise PatternConfigError(f"{label}: invalid regex ({exc.msg})") from exc
+        if compiled.search(""):
+            raise PatternConfigError(f"{label}: regex matches the empty string")
+        risk = entry.get("risk", 0.95)
+        confidence = entry.get("confidence", 0.95)
+        for field, value in (("risk", risk), ("confidence", confidence)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 1:
+                raise PatternConfigError(f"{label}: {field} must be a number in (0, 1]")
+        patterns.append(DlpPattern(f"CUSTOM_{name}", compiled, float(risk), float(confidence)))
+    return patterns
+
+
 class WarmPromptArmorEngine:
     """Wrapper around prompt-armor with council fallback explicitly disabled."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        extra_patterns: List[DlpPattern] | None = None,
+        config_error: str | None = None,
+    ) -> None:
+        self.dlp_patterns: List[DlpPattern] = BUILTIN_DLP_PATTERNS + list(extra_patterns or [])
+        # A broken ARMORCEPT_EXTRA_PATTERNS file blocks every scan (fail closed,
+        # whatever ARMORCEPT_FAIL_OPEN says) instead of silently dropping rules.
+        self.config_error = config_error
         self._native_analyze = None
         self._native_armor = None
         self.is_native_loaded = False
@@ -80,6 +216,19 @@ class WarmPromptArmorEngine:
     def analyze(self, text: str) -> Dict[str, Any]:
         start_ns = time.perf_counter_ns()
 
+        if self.config_error is not None:
+            return {
+                "risk_score": 1.0,
+                "confidence": 1.0,
+                "decision": "BLOCK",
+                "categories": [f"ARMORCEPT_CONFIG_ERROR: {self.config_error}"],
+                "dlp_categories": [],
+                "evidence": {},
+                "latency_ms": 0.0,
+                "council_enabled": False,
+                "engine_mode": "full" if self.is_native_loaded else "lightweight_fallback",
+            }
+
         if self._native_armor is not None and hasattr(self._native_armor, "analyze"):
             raw = self._native_armor.analyze(text)
             return self._merge_local_dlp(self._normalize_result(raw, start_ns), text)
@@ -95,48 +244,12 @@ class WarmPromptArmorEngine:
 
     def _scan_local_dlp(self, text: str) -> List[tuple[str, float, float, str]]:
         """Scans for high-confidence local secrets/DLP patterns."""
-        dlp_patterns = [
-            (
-                r"\b(AKIA|ASIA)[0-9A-Z]{16}\b",
-                "SECRET_LEAK_AWS_ACCESS_KEY",
-                0.96,
-                0.98,
-            ),
-            (
-                r"\b(ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,})\b",
-                "SECRET_LEAK_GITHUB_TOKEN",
-                0.97,
-                0.98,
-            ),
-            (
-                r"\bsk-(ant-api03-[A-Za-z0-9\-_]{20,}|proj-[A-Za-z0-9\-_]{20,}|[A-Za-z0-9]{32,})\b",
-                "SECRET_LEAK_API_KEY",
-                0.96,
-                0.98,
-            ),
-            (
-                r"\bAIza[0-9A-Za-z\-_]{35}\b",
-                "SECRET_LEAK_GCP_API_KEY",
-                0.95,
-                0.97,
-            ),
-            (
-                r"-----BEGIN (RSA |EC |OPENSSH |DSA |PRIVATE )?PRIVATE KEY-----",
-                "SECRET_LEAK_PRIVATE_KEY",
-                0.98,
-                0.99,
-            ),
-            (
-                r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b",
-                "DLP_US_SSN",
-                0.91,
-                0.93,
-            ),
-        ]
         matches: List[tuple[str, float, float, str]] = []
-        for regex, category, risk, conf in dlp_patterns:
-            if re.search(regex, text):
-                matches.append((category, risk, conf, regex))
+        for pattern in self.dlp_patterns:
+            if pattern.regex.search(text):
+                matches.append(
+                    (pattern.category, pattern.risk, pattern.confidence, pattern.regex.pattern)
+                )
         return matches
 
     def _merge_local_dlp(self, result: Dict[str, Any], text: str) -> Dict[str, Any]:
@@ -396,9 +509,24 @@ def main() -> None:
         default=8443,
         help="HTTP bind port (pass 0 for an OS-assigned ephemeral port)",
     )
+    parser.add_argument(
+        "--extra-patterns",
+        default="",
+        help="Path to a JSON file of custom DLP patterns (ARMORCEPT_EXTRA_PATTERNS)",
+    )
     args = parser.parse_args()
 
-    engine = WarmPromptArmorEngine()
+    extra: List[DlpPattern] = []
+    config_error: str | None = None
+    if args.extra_patterns:
+        try:
+            extra = load_extra_patterns(args.extra_patterns)
+        except PatternConfigError as exc:
+            config_error = f"invalid ARMORCEPT_EXTRA_PATTERNS: {exc}"
+            sys.stderr.write(f"🛡️ ArmorCept: {config_error}\n")
+            sys.stderr.flush()
+
+    engine = WarmPromptArmorEngine(extra_patterns=extra, config_error=config_error)
     if args.mode == "http":
         run_http_daemon(engine, args.host, args.port)
     else:

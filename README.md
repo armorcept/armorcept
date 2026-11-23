@@ -114,6 +114,7 @@ Configure ArmorCept in `.claude/settings.json` (or enterprise managed policy set
 | `ARMORCEPT_INTERACTIVE_OVERRIDE` | `false` | When `true` in `LOCAL` mode (or when explicitly enabled in enterprise managed policy), prompts the user via `$.ui.ask` to allow a blocked action once. |
 | `ARMORCEPT_EXEMPT_TOOLS` | `""` | Comma-separated list of tool names to exempt from scanning (e.g., `Glob,LS`). |
 | `ARMORCEPT_ALLOWLIST_PATHS` | `""` | Comma-separated glob patterns for file paths exempt from tool scanning (e.g., `docs/public/**,*.md`). Dot segments are resolved before matching. A pattern without a leading `/` matches that path anywhere on disk; start it with `/` to anchor it. Symlinks are not resolved. |
+| `ARMORCEPT_EXTRA_PATTERNS` | *(unset)* | Path to a JSON file of custom secret/DLP patterns for the local engine (supports `~/` and session-relative paths). See [Secret patterns](#secret-patterns). |
 | `ARMORCEPT_ALLOW_GCLOUD_ADC` | `false` | Set to `true` to permit ambient `~/.config/gcloud/application_default_credentials.json` or `gcloud auth application-default print-access-token` fallback when `GOOGLE_APPLICATION_CREDENTIALS` is unset. |
 | `PROMPT_ARMOR_ENDPOINT` | `stdio` | Set to an explicit `http://127.0.0.1:<port>/analyze` URL to use an externally managed daemon instead of the auto-spawned warm daemon. |
 | `PROMPT_ARMOR_TIMEOUT_MS` | `5000` | Timeout in milliseconds for local `prompt-armor` requests. |
@@ -127,6 +128,39 @@ Configure ArmorCept in `.claude/settings.json` (or enterprise managed policy set
 | `GOOGLE_CLOUD_LOCATION` | `us-central1` | Google Cloud region for Model Armor (`us-central1`, `europe-west1`, etc.). |
 | `MODEL_ARMOR_TEMPLATE_ID` | *(unset)* | Model Armor template ID configured with your SDP/DLP, PI/Jailbreak, and RAI filters. |
 | `MODEL_ARMOR_TIMEOUT_MS` | `5000` | Timeout in milliseconds for Google Cloud Model Armor requests. |
+
+## Secret Patterns
+
+The local engine (`LOCAL` and `WATERFALL` modes) checks every payload against these deterministic patterns:
+
+| Category | Matches |
+| :--- | :--- |
+| `SECRET_LEAK_ANTHROPIC_KEY` | Anthropic API keys (`sk-ant-api03-…`), OAuth tokens (`sk-ant-oat01-…`, as in `CLAUDE_CODE_OAUTH_TOKEN`) and admin keys |
+| `SECRET_LEAK_API_KEY` | OpenAI-style `sk-proj-…` and `sk-…` keys |
+| `SECRET_LEAK_AWS_ACCESS_KEY` | `AKIA…` / `ASIA…` access key IDs |
+| `SECRET_LEAK_GITHUB_TOKEN` | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` and `github_pat_` tokens |
+| `SECRET_LEAK_GCP_API_KEY` | Google `AIza…` API keys |
+| `SECRET_LEAK_SLACK_TOKEN` | `xoxa-`, `xoxb-`, `xoxp-`, `xoxr-`, `xoxs-` tokens |
+| `SECRET_LEAK_STRIPE_KEY` | Stripe live secret and restricted keys (`sk_live_`, `rk_live_`) |
+| `SECRET_LEAK_NPM_TOKEN` | npm access tokens (`npm_…`) |
+| `SECRET_LEAK_PRIVATE_KEY` | PEM private key headers (RSA, EC, DSA, OpenSSH, PKCS#8 and encrypted PKCS#8), including keys inside service-account JSON |
+| `DLP_US_SSN` | US Social Security numbers |
+
+### Custom patterns
+
+Set `ARMORCEPT_EXTRA_PATTERNS` to a JSON file holding a list of patterns (or `{"patterns": [...]}`):
+
+```json
+[
+  { "name": "ACME_API_TOKEN", "regex": "\\bacme_[a-f0-9]{32}\\b", "risk": 0.95 }
+]
+```
+
+- `name`: 3–64 characters of `A-Z`, `0-9` and `_`. Matches are reported as `CUSTOM_<name>`.
+- `regex`: a Python regular expression, at most 1,000 characters, that must not match the empty string.
+- `risk` and `confidence` (optional, default `0.95`): numbers in `(0, 1]`. A risk of `0.75` or more blocks.
+
+The file is validated when the engine starts. If it can't be read or any entry is invalid, every scan is blocked with `ARMORCEPT_CONFIG_ERROR: invalid ARMORCEPT_EXTRA_PATTERNS: …`, which names the bad entry but never echoes its regex. This happens even with `ARMORCEPT_FAIL_OPEN=true`, so a typo can't quietly switch your rules off. Custom patterns don't apply in `CLOUD` mode, which doesn't run the local engine.
 
 ## Development & Verification
 
@@ -142,6 +176,9 @@ npm run validate
 
 # Run the Claude Code plugin test suite
 npm test
+
+# Run the Python engine unit tests
+python3 -I -m unittest discover -s tests -p 'test_*.py'
 ```
 
 ## Acknowledgments

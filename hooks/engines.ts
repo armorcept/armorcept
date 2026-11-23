@@ -185,7 +185,16 @@ export async function resolvePythonBinary(
  * a slow start never blocks a hook for long and never causes the
  * still-starting process to be killed and respawned.
  */
-export function startWarmDaemon($: EngineInterface): Promise<string | undefined> {
+function engineExtraArgs(cfg: RuntimeConfig | undefined): string[] {
+  return cfg?.extraPatternsPath
+    ? ['--extra-patterns', cfg.extraPatternsPath]
+    : [];
+}
+
+export function startWarmDaemon(
+  $: EngineInterface,
+  cfg?: RuntimeConfig
+): Promise<string | undefined> {
   if (warmDaemonUrl) {
     return Promise.resolve(warmDaemonUrl);
   }
@@ -227,6 +236,7 @@ export function startWarmDaemon($: EngineInterface): Promise<string | undefined>
           '127.0.0.1',
           '--port',
           '0',
+          ...engineExtraArgs(cfg),
         ],
         env: {
           ARMORCEPT_DAEMON_TOKEN: token,
@@ -381,10 +391,13 @@ async function callStdioOneShot(
 ): Promise<PromptArmorResult> {
   const { binary: pythonBin } = await resolvePythonBinary($);
   const daemonPath = `${$.plugin.root}/python/daemon.py`;
-  const proc = await $.process.run([pythonBin, daemonPath, '--mode', 'stdio'], {
-    stdin: JSON.stringify({ text }) + '\n',
-    timeoutMs: cfg.promptArmorTimeoutMs,
-  });
+  const proc = await $.process.run(
+    [pythonBin, daemonPath, '--mode', 'stdio', ...engineExtraArgs(cfg)],
+    {
+      stdin: JSON.stringify({ text }) + '\n',
+      timeoutMs: cfg.promptArmorTimeoutMs,
+    }
+  );
 
   if (proc.exitCode !== 0) {
     throw new Error(
@@ -423,7 +436,7 @@ export async function runPromptArmor(
         ? 0
         : Math.min(30_000, 1000 * 2 ** (daemonFailureCount - 1));
     if (Date.now() - lastDaemonSpawnAttemptMs >= backoffMs) {
-      void startWarmDaemon($);
+      void startWarmDaemon($, cfg);
     }
   }
 

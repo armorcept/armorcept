@@ -709,6 +709,52 @@ describe('ArmorCept — Sandbox Hook Pipeline Integration Tests', () => {
     expect(poisonedResultCall.deny).toContain('output withheld by ArmorCept');
   });
 
+  test('ARMORCEPT_EXTRA_PATTERNS resolves against the session cwd and reaches the engine argv', async ($, on) => {
+    expect(
+      buildRuntimeConfig(
+        { ARMORCEPT_EXTRA_PATTERNS: './sec/patterns.json' },
+        '/workspace'
+      ).extraPatternsPath
+    ).toBe('/workspace/sec/patterns.json');
+    expect(buildRuntimeConfig({}).extraPatternsPath).toBeUndefined();
+
+    registerBaseMocks(on, {
+      ARMORCEPT_MODE: 'LOCAL',
+      ARMORCEPT_EXTRA_PATTERNS: '~/armorcept/patterns.json',
+      HOME: '/home/alice',
+    });
+    let seenArgv: readonly string[] = [];
+    on('process.run', ($, e) => {
+      seenArgv = e.argv;
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            decision: 'BLOCK',
+            risk_score: 1,
+            confidence: 1,
+            categories: [
+              'ARMORCEPT_CONFIG_ERROR: invalid ARMORCEPT_EXTRA_PATTERNS: entry 0 ("ACME"): invalid regex',
+            ],
+            dlp_categories: [],
+          }),
+          stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      };
+    });
+
+    const res = await $.prompt.submit({
+      text: 'anything',
+      wait: false,
+      origin: { kind: 'composer' },
+    });
+    expect(seenArgv).toContain('--extra-patterns');
+    expect(seenArgv).toContain('/home/alice/armorcept/patterns.json');
+    expect(res.drop).toContain('ARMORCEPT_CONFIG_ERROR');
+  });
+
   test('Warm HTTP daemon lifecycle: uses X-ArmorCept-Token header and falls back to stdio if HTTP fails', async ($, on) => {
     registerBaseMocks(on, {
       ARMORCEPT_MODE: 'LOCAL',

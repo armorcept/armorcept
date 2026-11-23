@@ -61,6 +61,22 @@ export function parseCsvList(val: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/** Expands ~/ against HOME and resolves relative paths against the session cwd. */
+export function resolveUserPath(
+  value: string | undefined,
+  home: string | undefined,
+  sessionCwd: string | undefined
+): string | undefined {
+  if (!value) return undefined;
+  if (value.startsWith('~/') && home) {
+    return `${home.replace(/\/+$/, '')}/${value.slice(2)}`;
+  }
+  if (!value.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(value) && sessionCwd) {
+    return `${sessionCwd.replace(/\/+$/, '')}/${value.replace(/^\.\//, '')}`;
+  }
+  return value;
+}
+
 export interface RawConfigEnv {
   ARMORCEPT_MODE?: string;
   ARMORCEPT_FAIL_OPEN?: string;
@@ -76,6 +92,7 @@ export interface RawConfigEnv {
   ARMORCEPT_INTERACTIVE_OVERRIDE?: string;
   ARMORCEPT_EXEMPT_TOOLS?: string;
   ARMORCEPT_ALLOWLIST_PATHS?: string;
+  ARMORCEPT_EXTRA_PATTERNS?: string;
   GOOGLE_APPLICATION_CREDENTIALS?: string;
   GOOGLE_CLOUD_ACCESS_TOKEN?: string;
   GOOGLE_CLOUD_PROJECT?: string;
@@ -183,20 +200,16 @@ export function buildRuntimeConfig(
   }
 
   const rawHome = stripQuotes(raw.HOME);
-  let googleApplicationCredentials = stripQuotes(
-    raw.GOOGLE_APPLICATION_CREDENTIALS
+  const googleApplicationCredentials = resolveUserPath(
+    stripQuotes(raw.GOOGLE_APPLICATION_CREDENTIALS),
+    rawHome,
+    sessionCwd
   );
-  if (googleApplicationCredentials) {
-    if (googleApplicationCredentials.startsWith('~/') && rawHome) {
-      googleApplicationCredentials = `${rawHome.replace(/\/+$/, '')}/${googleApplicationCredentials.slice(2)}`;
-    } else if (
-      !googleApplicationCredentials.startsWith('/') &&
-      !/^[A-Za-z]:[\\/]/.test(googleApplicationCredentials) &&
-      sessionCwd
-    ) {
-      googleApplicationCredentials = `${sessionCwd.replace(/\/+$/, '')}/${googleApplicationCredentials.replace(/^\.\//, '')}`;
-    }
-  }
+  const extraPatternsPath = resolveUserPath(
+    stripQuotes(raw.ARMORCEPT_EXTRA_PATTERNS),
+    rawHome,
+    sessionCwd
+  );
 
   // Interactive override defaults to false whenever cloud mode is active
   const defaultInteractiveOverride = false;
@@ -223,6 +236,7 @@ export function buildRuntimeConfig(
     interactiveOverride,
     exemptTools: parseCsvList(raw.ARMORCEPT_EXEMPT_TOOLS),
     allowlistPaths: parseCsvList(raw.ARMORCEPT_ALLOWLIST_PATHS),
+    extraPatternsPath,
     googleApplicationCredentials,
     googleCloudAccessToken: stripQuotes(raw.GOOGLE_CLOUD_ACCESS_TOKEN),
     googleCloudProject,
@@ -262,6 +276,7 @@ export async function readRuntimeConfig(
     rawInteractiveOverride,
     rawExemptTools,
     rawAllowlistPaths,
+    rawExtraPatterns,
     rawGcpCreds,
     rawGcpToken,
     rawGcpProject,
@@ -283,6 +298,7 @@ export async function readRuntimeConfig(
     $.env.get('ARMORCEPT_INTERACTIVE_OVERRIDE'),
     $.env.get('ARMORCEPT_EXEMPT_TOOLS'),
     $.env.get('ARMORCEPT_ALLOWLIST_PATHS'),
+    $.env.get('ARMORCEPT_EXTRA_PATTERNS'),
     $.env.get('GOOGLE_APPLICATION_CREDENTIALS'),
     $.env.get('GOOGLE_CLOUD_ACCESS_TOKEN'),
     $.env.get('GOOGLE_CLOUD_PROJECT'),
@@ -344,6 +360,8 @@ export async function readRuntimeConfig(
         policyEnv['ARMORCEPT_EXEMPT_TOOLS'] ?? rawExemptTools,
       ARMORCEPT_ALLOWLIST_PATHS:
         policyEnv['ARMORCEPT_ALLOWLIST_PATHS'] ?? rawAllowlistPaths,
+      ARMORCEPT_EXTRA_PATTERNS:
+        policyEnv['ARMORCEPT_EXTRA_PATTERNS'] ?? rawExtraPatterns,
       GOOGLE_APPLICATION_CREDENTIALS:
         policyEnv['GOOGLE_APPLICATION_CREDENTIALS'] ?? rawGcpCreds,
       GOOGLE_CLOUD_ACCESS_TOKEN:

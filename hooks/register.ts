@@ -82,7 +82,7 @@ export const register: Register = (on: On): void => {
           !cfg.promptArmorEndpoint.startsWith('http://') &&
           !cfg.promptArmorEndpoint.startsWith('https://')
         ) {
-          void startWarmDaemon($);
+          void startWarmDaemon($, cfg);
         }
         if (!hasVenv && cfg.promptArmorEndpoint === 'stdio') {
           safeUi(() =>

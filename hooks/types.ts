@@ -23,6 +23,8 @@ export interface RuntimeConfig {
   interactiveOverride: boolean;
   exemptTools: readonly string[];
   allowlistPaths: readonly string[];
+  /** Absolute path to a JSON file of custom DLP patterns, passed to the local engine. */
+  extraPatternsPath?: string;
   googleApplicationCredentials?: string;
   googleCloudAccessToken?: string;
   googleCloudProject?: string;
