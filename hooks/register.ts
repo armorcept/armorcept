@@ -29,6 +29,7 @@ import {
   safeUi,
 } from './format';
 import { evaluateArmorCept } from './orchestrator';
+import { getLoadedExactSecretNames } from './secrets';
 import type { EvaluationVerdict, RuntimeConfig } from './types';
 
 async function maybeAskInteractiveOverride(
@@ -76,6 +77,18 @@ export const register: Register = (on: On): void => {
     try {
       resetRuntimeConfigCache();
       const cfg = await readRuntimeConfig($, true);
+      const loadedSecrets = getLoadedExactSecretNames();
+      const skippedSecrets = cfg.secretEnvVars.filter(
+        (name) => !loadedSecrets.includes(name)
+      );
+      if (skippedSecrets.length > 0) {
+        safeUi(() =>
+          $.ui.toast(
+            `⚠️ ArmorCept: not matching ${skippedSecrets.join(', ')} (unset or shorter than 16 characters)`,
+            { timeoutMs: 6000 }
+          )
+        );
+      }
       if (cfg.mode !== 'CLOUD') {
         const { hasVenv } = await resolvePythonBinary($);
         if (

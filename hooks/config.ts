@@ -3,6 +3,8 @@
  */
 
 import type { EngineInterface } from 'claude-code';
+import { resolvePythonBinary } from './engines';
+import { clearExactSecrets, readEnvValues, setExactSecrets } from './secrets';
 import type { ArmorCeptMode, LocalDlpAction, RuntimeConfig } from './types';
 
 let cachedConfig: RuntimeConfig | undefined;
@@ -93,6 +95,7 @@ export interface RawConfigEnv {
   ARMORCEPT_EXEMPT_TOOLS?: string;
   ARMORCEPT_ALLOWLIST_PATHS?: string;
   ARMORCEPT_EXTRA_PATTERNS?: string;
+  ARMORCEPT_SECRET_ENV_VARS?: string;
   GOOGLE_APPLICATION_CREDENTIALS?: string;
   GOOGLE_CLOUD_ACCESS_TOKEN?: string;
   GOOGLE_CLOUD_PROJECT?: string;
@@ -211,6 +214,15 @@ export function buildRuntimeConfig(
     sessionCwd
   );
 
+  const secretEnvVars = parseCsvList(raw.ARMORCEPT_SECRET_ENV_VARS);
+  for (const name of secretEnvVars) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new Error(
+        `Invalid ARMORCEPT_SECRET_ENV_VARS entry "${name}": expected environment variable names separated by commas.`
+      );
+    }
+  }
+
   // Interactive override defaults to false whenever cloud mode is active
   const defaultInteractiveOverride = false;
   const interactiveOverride = parseBool(
@@ -237,6 +249,7 @@ export function buildRuntimeConfig(
     exemptTools: parseCsvList(raw.ARMORCEPT_EXEMPT_TOOLS),
     allowlistPaths: parseCsvList(raw.ARMORCEPT_ALLOWLIST_PATHS),
     extraPatternsPath,
+    secretEnvVars,
     googleApplicationCredentials,
     googleCloudAccessToken: stripQuotes(raw.GOOGLE_CLOUD_ACCESS_TOKEN),
     googleCloudProject,
@@ -277,6 +290,7 @@ export async function readRuntimeConfig(
     rawExemptTools,
     rawAllowlistPaths,
     rawExtraPatterns,
+    rawSecretEnvVars,
     rawGcpCreds,
     rawGcpToken,
     rawGcpProject,
@@ -299,6 +313,7 @@ export async function readRuntimeConfig(
     $.env.get('ARMORCEPT_EXEMPT_TOOLS'),
     $.env.get('ARMORCEPT_ALLOWLIST_PATHS'),
     $.env.get('ARMORCEPT_EXTRA_PATTERNS'),
+    $.env.get('ARMORCEPT_SECRET_ENV_VARS'),
     $.env.get('GOOGLE_APPLICATION_CREDENTIALS'),
     $.env.get('GOOGLE_CLOUD_ACCESS_TOKEN'),
     $.env.get('GOOGLE_CLOUD_PROJECT'),
@@ -362,6 +377,8 @@ export async function readRuntimeConfig(
         policyEnv['ARMORCEPT_ALLOWLIST_PATHS'] ?? rawAllowlistPaths,
       ARMORCEPT_EXTRA_PATTERNS:
         policyEnv['ARMORCEPT_EXTRA_PATTERNS'] ?? rawExtraPatterns,
+      ARMORCEPT_SECRET_ENV_VARS:
+        policyEnv['ARMORCEPT_SECRET_ENV_VARS'] ?? rawSecretEnvVars,
       GOOGLE_APPLICATION_CREDENTIALS:
         policyEnv['GOOGLE_APPLICATION_CREDENTIALS'] ?? rawGcpCreds,
       GOOGLE_CLOUD_ACCESS_TOKEN:
@@ -394,6 +411,13 @@ export async function readRuntimeConfig(
     !policyAllowsInteractiveOverride
   ) {
     cfg.interactiveOverride = false;
+  }
+
+  // Values stay in hooks/secrets.ts memory only; they are never put on cfg.
+  clearExactSecrets();
+  if (cfg.secretEnvVars.length > 0) {
+    const { binary } = await resolvePythonBinary($);
+    setExactSecrets(await readEnvValues($, cfg.secretEnvVars, binary));
   }
 
   cachedConfig = cfg;

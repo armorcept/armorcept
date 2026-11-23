@@ -25,6 +25,8 @@ export interface RuntimeConfig {
   allowlistPaths: readonly string[];
   /** Absolute path to a JSON file of custom DLP patterns, passed to the local engine. */
   extraPatternsPath?: string;
+  /** Names (not values) of environment variables whose values are matched exactly. */
+  secretEnvVars: readonly string[];
   googleApplicationCredentials?: string;
   googleCloudAccessToken?: string;
   googleCloudProject?: string;
@@ -50,6 +52,7 @@ export interface EvaluationVerdict {
     | 'Prompt-Armor'
     | 'ArmorCept Built-in'
     | 'ArmorCept DLP'
+    | 'ArmorCept Secrets'
     | 'Model Armor'
     | 'ArmorCept';
   mode: ArmorCeptMode;

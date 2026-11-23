@@ -26,7 +26,7 @@ Because ArmorCept inspects user prompts, tool arguments, and (optionally) tool o
 ## What ArmorCept Accesses
 
 - **Hooks**: `session.start`, `prompt.submit` and `tool.call`. It can block a prompt or tool call, and withholds tool output when `ARMORCEPT_SCAN_TOOL_RESULTS=true`.
-- **Processes**: starts `python/daemon.py` (a localhost-only HTTP worker, or one-shot `stdio`). In `CLOUD`/`WATERFALL` mode it runs `scripts/mint-token.mjs` with `node` to mint an OAuth2 access token, which calls `gcloud` only when `ARMORCEPT_ALLOW_GCLOUD_ADC=true`.
+- **Processes**: starts `python/daemon.py` (a localhost-only HTTP worker, or one-shot `stdio`). When `ARMORCEPT_SECRET_ENV_VARS` is set, it runs `printenv` (or `python3`) once per config load to read those variables. In `CLOUD`/`WATERFALL` mode it runs `scripts/mint-token.mjs` with `node` to mint an OAuth2 access token, which calls `gcloud` only when `ARMORCEPT_ALLOW_GCLOUD_ADC=true`.
 - **Network**: `127.0.0.1` for the local worker. In `CLOUD`/`WATERFALL` mode it also contacts your regional Model Armor endpoint and Google OAuth (see [Data Privacy & Network Flows](#data-privacy--network-flows)).
 - **Files and settings**: reads its own environment variables, the settings files, and the service account key at `GOOGLE_APPLICATION_CREDENTIALS`. It writes nothing outside the plugin directory.
 
@@ -114,6 +114,7 @@ Configure ArmorCept in `.claude/settings.json` (or enterprise managed policy set
 | `ARMORCEPT_INTERACTIVE_OVERRIDE` | `false` | When `true` in `LOCAL` mode (or when explicitly enabled in enterprise managed policy), prompts the user via `$.ui.ask` to allow a blocked action once. |
 | `ARMORCEPT_EXEMPT_TOOLS` | `""` | Comma-separated list of tool names to exempt from scanning (e.g., `Glob,LS`). |
 | `ARMORCEPT_ALLOWLIST_PATHS` | `""` | Comma-separated glob patterns for file paths exempt from tool scanning (e.g., `docs/public/**,*.md`). Dot segments are resolved before matching. A pattern without a leading `/` matches that path anywhere on disk; start it with `/` to anchor it. Symlinks are not resolved. |
+| `ARMORCEPT_SECRET_ENV_VARS` | *(unset)* | Comma-separated names of environment variables whose **values** are matched exactly in prompts, tool arguments and tool results (e.g. `GH_TOKEN,ANTHROPIC_API_KEY`). See [Exact secret matching](#exact-secret-matching). |
 | `ARMORCEPT_EXTRA_PATTERNS` | *(unset)* | Path to a JSON file of custom secret/DLP patterns for the local engine (supports `~/` and session-relative paths). See [Secret patterns](#secret-patterns). |
 | `ARMORCEPT_ALLOW_GCLOUD_ADC` | `false` | Set to `true` to permit ambient `~/.config/gcloud/application_default_credentials.json` or `gcloud auth application-default print-access-token` fallback when `GOOGLE_APPLICATION_CREDENTIALS` is unset. |
 | `PROMPT_ARMOR_ENDPOINT` | `stdio` | Set to an explicit `http://127.0.0.1:<port>/analyze` URL to use an externally managed daemon instead of the auto-spawned warm daemon. |
@@ -145,6 +146,22 @@ The local engine (`LOCAL` and `WATERFALL` modes) checks every payload against th
 | `SECRET_LEAK_NPM_TOKEN` | npm access tokens (`npm_…`) |
 | `SECRET_LEAK_PRIVATE_KEY` | PEM private key headers (RSA, EC, DSA, OpenSSH, PKCS#8 and encrypted PKCS#8), including keys inside service-account JSON |
 | `DLP_US_SSN` | US Social Security numbers |
+
+### Exact secret matching
+
+Format rules miss tokens with prefixes they don't know. When you know which secrets are present, which is usually the case on CI hosts and agent runners, list them by name:
+
+```json
+{ "env": { "ARMORCEPT_SECRET_ENV_VARS": "GH_TOKEN,NPM_TOKEN,CLAUDE_CODE_OAUTH_TOKEN" } }
+```
+
+When the configuration loads, which happens at `session.start`, ArmorCept reads those variables' values. A hook module can only read variables it names in its code, so it reads them with a short-lived `printenv` (or `python3`) child process. It keeps them in hook memory only. It then blocks any prompt, tool call or (with `ARMORCEPT_SCAN_TOOL_RESULTS=true`) tool result that contains one of the values, as category `SECRET_EXACT_<NAME>`, with risk and confidence 1.0. It also matches the value's base64 (standard and URL-safe, at any alignment), URL-encoded and JSON-escaped forms, and the value split across a line break.
+
+- Variables that are unset or shorter than 16 characters are skipped, and a toast names them.
+- The value is never logged, displayed, put in a verdict or sent to an engine. Matching runs in the hook process before any scan, so it also works in `CLOUD` mode, and the values never reach Model Armor.
+- `ARMORCEPT_LOCAL_DLP_ACTION` does not apply: an exact match can't be a false positive, so it always blocks.
+
+> **Threat model.** Scanning tool *arguments* cannot catch `curl -H "Authorization: Bearer $GH_TOKEN" …`, because the call holds the variable's name, not its value; the shell expands it later. What exact matching on tool **results** does is keep a printed secret out of the model context and any transcript logs, for example from `env`, `cat config.json` or a committed `.env`. To get that protection, turn on `ARMORCEPT_SCAN_TOOL_RESULTS=true` alongside `ARMORCEPT_SECRET_ENV_VARS`.
 
 ### Custom patterns
 

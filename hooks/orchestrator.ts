@@ -6,6 +6,7 @@ import type { EngineInterface } from 'claude-code';
 import { getLastKnownFailOpen, readRuntimeConfig } from './config';
 import { runModelArmor, runPromptArmor } from './engines';
 import { safeUi } from './format';
+import { findExactSecrets, type SecretMatch } from './secrets';
 import type {
   ArmorCeptMode,
   EvaluationVerdict,
@@ -294,6 +295,27 @@ export function splitIntoChunks(
   return chunks;
 }
 
+/** Builds a BLOCK verdict for exact secret matches without ever including the value. */
+export function exactSecretVerdict(
+  matches: readonly SecretMatch[],
+  mode: ArmorCeptMode
+): EvaluationVerdict {
+  const categories = Array.from(new Set(matches.map((m) => m.category)));
+  const first = matches[0];
+  const where = first
+    ? ` (${first.encoding} at offset ${first.start}${matches.length > 1 ? `, ${matches.length} matches` : ''})`
+    : '';
+  return {
+    decision: 'BLOCK',
+    source: 'ArmorCept Secrets',
+    mode,
+    reason: `Exact value of $${first?.name ?? 'secret'} found${where}`,
+    findings: categories,
+    score: 1,
+    confidence: 1,
+  };
+}
+
 export async function evaluateArmorCept(
   $: EngineInterface,
   text: string
@@ -307,6 +329,13 @@ export async function evaluateArmorCept(
     effectiveFailOpen = cfg.failOpen;
 
     safeUi(() => $.ui.status('🛡️ ArmorCept: Scanning...'));
+
+    // Exact secret values are checked locally first, so they are caught even
+    // in CLOUD mode and never sent to an engine.
+    const exact = findExactSecrets(text);
+    if (exact.length > 0) {
+      return exactSecretVerdict(exact, cfg.mode);
+    }
 
     if (text.length > MAX_TOTAL_SCAN_CHARS) {
       throw new Error(
