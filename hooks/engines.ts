@@ -10,6 +10,7 @@ import type {
 } from 'claude-code';
 import type {
   EvaluationVerdict,
+  MatchSpan,
   PromptArmorDecision,
   PromptArmorResult,
   RuntimeConfig,
@@ -127,6 +128,23 @@ export function parsePromptArmorJson(parsed: unknown): PromptArmorResult {
     ? obj['dlp_categories']
     : [];
 
+  const dlpSpans: MatchSpan[] = [];
+  if (Array.isArray(obj['dlp_spans'])) {
+    for (const item of obj['dlp_spans'] as unknown[]) {
+      if (!Array.isArray(item) || item.length !== 3) continue;
+      const [category, start, end] = item as unknown[];
+      if (
+        typeof category === 'string' &&
+        Number.isInteger(start) &&
+        Number.isInteger(end) &&
+        (start as number) >= 0 &&
+        (end as number) > (start as number)
+      ) {
+        dlpSpans.push({ category, start: start as number, end: end as number });
+      }
+    }
+  }
+
   const engineModeRaw = obj['engine_mode'];
   const engine_mode =
     engineModeRaw === 'full' || engineModeRaw === 'lightweight_fallback'
@@ -141,6 +159,7 @@ export function parsePromptArmorJson(parsed: unknown): PromptArmorResult {
       String(item).replace(/^Category\./i, '')
     ),
     dlpCategories: rawDlpList.map((item) => String(item)),
+    dlpSpans,
     latency_ms:
       typeof obj['latency_ms'] === 'number' ? obj['latency_ms'] : undefined,
     engine_mode,

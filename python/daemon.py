@@ -89,6 +89,19 @@ BUILTIN_DLP_PATTERNS: List[DlpPattern] = [
     ),
 ]
 
+MAX_SPANS = 1000
+
+
+def _to_utf16_offsets(text: str, spans: List[List[Any]]) -> List[List[Any]]:
+    if not spans or all(ord(ch) < 0x10000 for ch in text):
+        return spans
+    # extra[i] = number of astral characters in text[:i]
+    extra = [0] * (len(text) + 1)
+    for i, ch in enumerate(text):
+        extra[i + 1] = extra[i] + (1 if ord(ch) >= 0x10000 else 0)
+    return [[cat, start + extra[start], end + extra[end]] for cat, start, end in spans]
+
+
 MAX_EXTRA_PATTERNS = 200
 MAX_EXTRA_REGEX_CHARS = 1000
 _EXTRA_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
@@ -252,11 +265,30 @@ class WarmPromptArmorEngine:
                 )
         return matches
 
+    def find_dlp_spans(self, text: str) -> List[List[Any]]:
+        """Returns [category, start, end] for every DLP match, as UTF-16 offsets.
+
+        The hooks run in JavaScript, whose string offsets count UTF-16 code
+        units, so offsets past an astral character are shifted to match.
+        """
+        spans: List[List[Any]] = []
+        for pattern in self.dlp_patterns:
+            for m in pattern.regex.finditer(text):
+                if m.end() > m.start():
+                    spans.append([pattern.category, m.start(), m.end()])
+                if len(spans) >= MAX_SPANS:
+                    break
+            if len(spans) >= MAX_SPANS:
+                break
+        return _to_utf16_offsets(text, spans)
+
     def _merge_local_dlp(self, result: Dict[str, Any], text: str) -> Dict[str, Any]:
         dlp_hits = self._scan_local_dlp(text)
         if not dlp_hits:
             result["dlp_categories"] = []
+            result["dlp_spans"] = []
             return result
+        result["dlp_spans"] = self.find_dlp_spans(text)
         categories = list(result.get("categories", []))
         dlp_categories: List[str] = []
         max_risk = float(result.get("risk_score", 0.0))
@@ -378,6 +410,7 @@ class WarmPromptArmorEngine:
             "decision": decision,
             "categories": matched_categories,
             "dlp_categories": dlp_categories,
+            "dlp_spans": self.find_dlp_spans(text) if dlp_hits else [],
             "evidence": {
                 "layer": "regex_fast_path",
                 "matched_rules": matched_rules,

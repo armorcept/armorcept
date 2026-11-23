@@ -115,6 +115,7 @@ Configure ArmorCept in `.claude/settings.json` (or enterprise managed policy set
 | `ARMORCEPT_DECISION_LOG_MAX_BYTES` | `10485760` | Rotate the decision log to `<path>.1` (one old file kept) when it would grow past this size. `0` disables rotation. |
 | `ARMORCEPT_LOCAL_DLP_ACTION` | `block` | Action for pure local DLP regex matches (e.g., `DLP_US_SSN`, `SECRET_LEAK_AWS_ACCESS_KEY`) in `LOCAL` mode: `block`, `warn`, or `allow`. |
 | `ARMORCEPT_SCAN_TOOL_RESULTS` | `false` | When `true`, scans tool output after execution and withholds poisoned/sensitive results from the model (`{ deny }`). |
+| `ARMORCEPT_TOOL_RESULT_ACTION` | `withhold` | With `ARMORCEPT_SCAN_TOOL_RESULTS=true`: `withhold` hides the whole result on any finding; `redact` replaces each DLP or secret match with `[REDACTED:<CATEGORY>]` and returns the rest. See [Redacting tool results](#redacting-tool-results). |
 | `ARMORCEPT_INTERACTIVE_OVERRIDE` | `false` | When `true` in `LOCAL` mode (or when explicitly enabled in enterprise managed policy), prompts the user via `$.ui.ask` to allow a blocked action once. |
 | `ARMORCEPT_EXEMPT_TOOLS` | `""` | Comma-separated list of tool names to exempt from scanning (e.g., `Glob,LS`). |
 | `ARMORCEPT_ALLOWLIST_PATHS` | `""` | Comma-separated glob patterns for file paths exempt from tool scanning (e.g., `docs/public/**,*.md`). Dot segments are resolved before matching. A pattern without a leading `/` matches that path anywhere on disk; start it with `/` to anchor it. Symlinks are not resolved. |
@@ -134,6 +135,19 @@ Configure ArmorCept in `.claude/settings.json` (or enterprise managed policy set
 | `MODEL_ARMOR_TEMPLATE_ID` | *(unset)* | Model Armor template ID configured with your SDP/DLP, PI/Jailbreak, and RAI filters. |
 | `MODEL_ARMOR_TIMEOUT_MS` | `5000` | Timeout in milliseconds for Google Cloud Model Armor requests. |
 
+## Redacting Tool Results
+
+By default, one DLP hit withholds a whole tool result. With a long build or test log, that hides everything else, and an autonomous agent usually stalls or retries. Set `ARMORCEPT_TOOL_RESULT_ACTION=redact` to keep the result and blank out only the matches:
+
+```text
+deploying with key [REDACTED:SECRET_LEAK_AWS_ACCESS_KEY] to us-east-1 ... done (42 tests passed)
+```
+
+- Redaction covers DLP patterns, custom patterns and exact secret matches, because the engine reports exactly where each one is. Spans found in overlapping 8 KiB chunks are merged, so a match that crosses a chunk boundary is redacted once.
+- After redacting, ArmorCept scans the result again, and returns it only if nothing is left to block.
+- Prompt-injection findings and Model Armor findings have no reliable span, so a result containing one is still withheld whole.
+- A redacted result is logged with `"action": "redacted"`. Audit mode (`ARMORCEPT_ENFORCEMENT=audit`) records the verdict and changes nothing.
+
 ## Audit Mode and the Decision Log
 
 `WARN` verdicts and blocks show up as toasts, which nobody sees in a headless (`claude -p`) run, in CI or under an agent runner. Two settings make ArmorCept's decisions visible there:
@@ -147,7 +161,7 @@ A log line looks like this:
 {"ts":"2026-11-23T09:14:02.118Z","session":"5b0e…","hook":"tool.call","decision":"BLOCK","action":"audited","enforcement":"audit","mode":"LOCAL","source":"Prompt-Armor","engine":"Prompt-Armor (full)","categories":["PROMPT_INJECTION"],"tool":"Bash","score":0.97,"confidence":0.98,"latency_ms":24}
 ```
 
-`decision` is what the engine recommended. `action` is what ArmorCept did: `allowed`, `warned`, `blocked`, `withheld`, `overridden` or `audited`. Lines never contain the payload, the matched text or a secret value. For engine errors, the categories hold only `ENGINE_ERROR`, and a short `error` field holds the error message with any loaded secret value redacted.
+`decision` is what the engine recommended. `action` is what ArmorCept did: `allowed`, `warned`, `blocked`, `withheld`, `redacted`, `overridden` or `audited`. Lines never contain the payload, the matched text or a secret value. For engine errors, the categories hold only `ENGINE_ERROR`, and a short `error` field holds the error message with any loaded secret value redacted.
 
 Lines are buffered in memory and appended by a short-lived local process off the hook's critical path, then flushed at `session.end`. The file is created with mode `0600`.
 

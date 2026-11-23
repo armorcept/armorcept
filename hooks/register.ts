@@ -39,6 +39,7 @@ import {
   type DecisionHook,
 } from './decisions';
 import { evaluateArmorCept } from './orchestrator';
+import { isRedactable, redactText } from './redact';
 import { getLoadedExactSecretNames } from './secrets';
 import type { EvaluationVerdict, RuntimeConfig } from './types';
 
@@ -77,6 +78,52 @@ async function maybeAskInteractiveOverride(
     // Dialog dismissed or headless (-p) run: always treat rejection as a block
   }
   return false;
+}
+
+type RedactResult =
+  | { kind: 'redacted'; toolResult: Record<string, unknown>; categories: string[] }
+  | { kind: 'withhold'; verdict: EvaluationVerdict };
+
+/**
+ * Redacts every model-visible field of a tool result. The field that was
+ * scanned reuses its verdict; the other one (when a result has both `text`
+ * and `result`) is scanned on its own. Any field that can't be redacted
+ * withholds the whole result.
+ */
+async function redactToolResult(
+  $: EngineInterface,
+  record: Record<string, unknown>,
+  scannedField: 'text' | 'result',
+  scannedVerdict: EvaluationVerdict
+): Promise<RedactResult> {
+  const next: Record<string, unknown> = { ...record };
+  const categories = new Set<string>();
+  for (const field of ['text', 'result'] as const) {
+    const value = record[field];
+    if (value === undefined || (field === 'text' && typeof value !== 'string')) {
+      continue;
+    }
+    const asText = typeof value === 'string' ? value : JSON.stringify(value);
+    const verdict =
+      field === scannedField ? scannedVerdict : await evaluateArmorCept($, asText);
+    if (verdict.decision !== 'BLOCK') continue;
+    const outcome = await redactText($, asText, verdict);
+    if (outcome.kind === 'withhold') {
+      return outcome;
+    }
+    outcome.categories.forEach((c) => categories.add(c));
+    if (typeof value === 'string') {
+      next[field] = outcome.text;
+    } else {
+      try {
+        next[field] = JSON.parse(outcome.text) as unknown;
+      } catch {
+        // A match spanned JSON structure; there's no safe partial result
+        return { kind: 'withhold', verdict };
+      }
+    }
+  }
+  return { kind: 'redacted', toolResult: next, categories: [...categories] };
 }
 
 async function logDecision(
@@ -311,6 +358,8 @@ export const register: Register = (on: On): void => {
       !('deny' in toolResult && toolResult.deny)
     ) {
       const resultRecord = toolResult as Record<string, unknown>;
+      const scannedField: 'text' | 'result' =
+        typeof resultRecord['text'] === 'string' ? 'text' : 'result';
       const resultText =
         typeof resultRecord['text'] === 'string'
           ? resultRecord['text']
@@ -330,6 +379,31 @@ export const register: Register = (on: On): void => {
           announceAudit($, resultVerdict, `${toolName} output`);
           await logDecision($, cfg, 'tool.result', resultVerdict, 'audited', latencyMs, toolName);
           return toolResult;
+        }
+        if (
+          resultVerdict.decision === 'BLOCK' &&
+          cfg.toolResultAction === 'redact' &&
+          isRedactable(resultVerdict)
+        ) {
+          const redaction = await redactToolResult(
+            $,
+            resultRecord,
+            scannedField,
+            resultVerdict
+          );
+          if (redaction.kind === 'redacted') {
+            const note = `🛡️ [ArmorCept Redacted] Tool (${toolName}) output — ${redaction.categories.join(', ')}`;
+            safeUi(() => $.ui.status(`🛡️ ArmorCept: Redacted (${resultVerdict.source})`));
+            safeUi(() => $.ui.toast(note, { timeoutMs: 5000 }));
+            await logDecision($, cfg, 'tool.result', resultVerdict, 'redacted', Date.now() - started, toolName);
+            return redaction.toolResult as typeof toolResult;
+          }
+          const withheldBy = redaction.verdict;
+          const banner = formatAlertBanner(withheldBy, `${toolName} output`);
+          safeUi(() => $.ui.status(`🛡️ ArmorCept: Withheld (${withheldBy.source})`));
+          safeUi(() => $.ui.toast(banner, { timeoutMs: 6000 }));
+          await logDecision($, cfg, 'tool.result', withheldBy, 'withheld', Date.now() - started, toolName);
+          return { deny: formatToolResultWithheldMessage(withheldBy, toolName) };
         }
         if (resultVerdict.decision === 'BLOCK') {
           const banner = formatAlertBanner(

@@ -108,6 +108,33 @@ class BuiltinPatternTests(unittest.TestCase):
         self.assertEqual(categories(self.engine, "npm install && git push origin main"), set())
 
 
+class SpanTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = daemon.WarmPromptArmorEngine()
+
+    @staticmethod
+    def utf16_slice(text: str, start: int, end: int) -> str:
+        return text.encode("utf-16-le")[start * 2 : end * 2].decode("utf-16-le")
+
+    def test_spans_cover_every_match_in_utf16_offsets(self) -> None:
+        key = fake("AKIA", 16, "ABC7")
+        text = f"\U0001F6E1 deploy {key} then \U0001F680 ssn 123-45-6789 and {key}"
+        spans = self.engine.find_dlp_spans(text)
+        self.assertEqual(len(spans), 3)
+        for category, start, end in spans:
+            matched = self.utf16_slice(text, start, end)
+            if category == "DLP_US_SSN":
+                self.assertEqual(matched, "123-45-6789")
+            else:
+                self.assertEqual(matched, key)
+
+    def test_analyze_reports_spans(self) -> None:
+        key = fake("AKIA", 16, "ABC7")
+        result = self.engine.analyze(f"x {key}")
+        self.assertEqual(result["dlp_spans"], [["SECRET_LEAK_AWS_ACCESS_KEY", 2, 22]])
+        self.assertEqual(self.engine.analyze("clean")["dlp_spans"], [])
+
+
 class ExtraPatternTests(unittest.TestCase):
     def write(self, content: object) -> str:
         fd, path = tempfile.mkstemp(suffix=".json")

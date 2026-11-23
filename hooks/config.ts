@@ -10,6 +10,7 @@ import type {
   Enforcement,
   LocalDlpAction,
   RuntimeConfig,
+  ToolResultAction,
 } from './types';
 
 let cachedConfig: RuntimeConfig | undefined;
@@ -108,6 +109,7 @@ export interface RawConfigEnv {
   ARMORCEPT_EXTRA_PATTERNS?: string;
   ARMORCEPT_SECRET_ENV_VARS?: string;
   ARMORCEPT_ENFORCEMENT?: string;
+  ARMORCEPT_TOOL_RESULT_ACTION?: string;
   ARMORCEPT_AUDIT_ENFORCE_SECRETS?: string;
   ARMORCEPT_DECISION_LOG?: string;
   ARMORCEPT_DECISION_LOG_MAX_BYTES?: string;
@@ -242,6 +244,18 @@ export function buildRuntimeConfig(
   }
   lastKnownAudit = enforcement === 'audit';
 
+  const rawResultAction = stripQuotes(raw.ARMORCEPT_TOOL_RESULT_ACTION)?.toLowerCase();
+  let toolResultAction: ToolResultAction = 'withhold';
+  if (rawResultAction) {
+    if (rawResultAction === 'withhold' || rawResultAction === 'redact') {
+      toolResultAction = rawResultAction;
+    } else {
+      throw new Error(
+        `Invalid ARMORCEPT_TOOL_RESULT_ACTION "${raw.ARMORCEPT_TOOL_RESULT_ACTION}". Expected withhold or redact.`
+      );
+    }
+  }
+
   const decisionLogMaxBytes = parseFiniteNumber(
     raw.ARMORCEPT_DECISION_LOG_MAX_BYTES,
     10 * 1024 * 1024,
@@ -292,6 +306,7 @@ export function buildRuntimeConfig(
     localDlpAction,
     allowGcloudAdc: parseBool(raw.ARMORCEPT_ALLOW_GCLOUD_ADC, false),
     scanToolResults: parseBool(raw.ARMORCEPT_SCAN_TOOL_RESULTS, false),
+    toolResultAction,
     interactiveOverride,
     exemptTools: parseCsvList(raw.ARMORCEPT_EXEMPT_TOOLS),
     allowlistPaths: parseCsvList(raw.ARMORCEPT_ALLOWLIST_PATHS),
@@ -339,6 +354,7 @@ export async function readRuntimeConfig(
     rawExtraPatterns,
     rawSecretEnvVars,
     rawEnforcement,
+    rawToolResultAction,
     rawAuditEnforceSecrets,
     rawDecisionLog,
     rawDecisionLogMaxBytes,
@@ -366,6 +382,7 @@ export async function readRuntimeConfig(
     $.env.get('ARMORCEPT_EXTRA_PATTERNS'),
     $.env.get('ARMORCEPT_SECRET_ENV_VARS'),
     $.env.get('ARMORCEPT_ENFORCEMENT'),
+    $.env.get('ARMORCEPT_TOOL_RESULT_ACTION'),
     $.env.get('ARMORCEPT_AUDIT_ENFORCE_SECRETS'),
     $.env.get('ARMORCEPT_DECISION_LOG'),
     $.env.get('ARMORCEPT_DECISION_LOG_MAX_BYTES'),
@@ -436,6 +453,8 @@ export async function readRuntimeConfig(
         policyEnv['ARMORCEPT_SECRET_ENV_VARS'] ?? rawSecretEnvVars,
       ARMORCEPT_ENFORCEMENT:
         policyEnv['ARMORCEPT_ENFORCEMENT'] ?? rawEnforcement,
+      ARMORCEPT_TOOL_RESULT_ACTION:
+        policyEnv['ARMORCEPT_TOOL_RESULT_ACTION'] ?? rawToolResultAction,
       ARMORCEPT_AUDIT_ENFORCE_SECRETS:
         policyEnv['ARMORCEPT_AUDIT_ENFORCE_SECRETS'] ?? rawAuditEnforceSecrets,
       ARMORCEPT_DECISION_LOG:

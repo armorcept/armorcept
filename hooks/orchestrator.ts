@@ -10,6 +10,7 @@ import { findExactSecrets, type SecretMatch } from './secrets';
 import type {
   ArmorCeptMode,
   EvaluationVerdict,
+  MatchSpan,
   PromptArmorDecision,
   PromptArmorResult,
   RuntimeConfig,
@@ -60,6 +61,7 @@ export function evaluateLocalVerdict(
         confidence: local.confidence,
         engineMode: local.engine_mode,
         warning: local.warning,
+        spans: local.dlpSpans,
       };
     }
     if (cfg.localDlpAction === 'warn') {
@@ -73,6 +75,7 @@ export function evaluateLocalVerdict(
         confidence: local.confidence,
         engineMode: local.engine_mode,
         warning: local.warning,
+        spans: local.dlpSpans,
       };
     }
   }
@@ -93,6 +96,7 @@ export function evaluateLocalVerdict(
       confidence: local.confidence,
       engineMode: local.engine_mode,
       warning: local.warning,
+      spans: local.dlpSpans,
     };
   }
 
@@ -114,6 +118,7 @@ export function evaluateLocalVerdict(
       confidence: local.confidence,
       engineMode: local.engine_mode,
       warning: local.warning,
+      spans: local.dlpSpans,
     };
   }
 
@@ -127,6 +132,7 @@ export function evaluateLocalVerdict(
     confidence: local.confidence,
     engineMode: local.engine_mode,
     warning: local.warning,
+    spans: local.dlpSpans,
   };
 }
 
@@ -158,6 +164,7 @@ function mergeLocalResults(
     dlpCategories: Array.from(
       new Set([...a.dlpCategories, ...b.dlpCategories])
     ),
+    dlpSpans: [...(a.dlpSpans ?? []), ...(b.dlpSpans ?? [])],
     latency_ms: (a.latency_ms ?? 0) + (b.latency_ms ?? 0),
     engine_mode: lightweight
       ? 'lightweight_fallback'
@@ -179,8 +186,20 @@ async function runLocalPass(
   cfg: RuntimeConfig
 ): Promise<PromptArmorResult> {
   let merged: PromptArmorResult | undefined;
-  for (const chunk of splitIntoChunks(text, MAX_LOCAL_SCAN_CHUNK_CHARS)) {
-    const result = await runPromptArmor($, chunk, cfg);
+  for (const { chunk, offset } of chunkWithOffsets(
+    text,
+    MAX_LOCAL_SCAN_CHUNK_CHARS
+  )) {
+    const raw = await runPromptArmor($, chunk, cfg);
+    // Chunk-relative spans become offsets into the whole text
+    const result: PromptArmorResult = {
+      ...raw,
+      dlpSpans: (raw.dlpSpans ?? []).map((s) => ({
+        ...s,
+        start: s.start + offset,
+        end: s.end + offset,
+      })),
+    };
     merged = mergeLocalResults(merged, result);
     const decisive =
       cfg.mode === 'LOCAL' || result.confidence >= cfg.waterfallMinConfidence;
@@ -253,6 +272,7 @@ async function evaluateText(
       escalatedToCloud: false,
       engineMode: local.engine_mode,
       warning: local.warning,
+      spans: local.dlpSpans,
     };
   }
 
@@ -273,26 +293,34 @@ async function evaluateText(
       escalatedToCloud: false,
       engineMode: local.engine_mode,
       warning: local.warning,
+      spans: local.dlpSpans,
     };
   }
 
   return await runCloudPass($, text, cfg, true);
 }
 
+export function chunkWithOffsets(
+  text: string,
+  chunkSize = MAX_LOCAL_SCAN_CHUNK_CHARS
+): { chunk: string; offset: number }[] {
+  if (text.length <= chunkSize) {
+    return [{ chunk: text, offset: 0 }];
+  }
+  const chunks: { chunk: string; offset: number }[] = [];
+  const step = Math.max(1024, chunkSize - CHUNK_OVERLAP_CHARS);
+  for (let offset = 0; offset < text.length; offset += step) {
+    chunks.push({ chunk: text.slice(offset, offset + chunkSize), offset });
+    if (offset + chunkSize >= text.length) break;
+  }
+  return chunks;
+}
+
 export function splitIntoChunks(
   text: string,
   chunkSize = MAX_LOCAL_SCAN_CHUNK_CHARS
 ): string[] {
-  if (text.length <= chunkSize) {
-    return [text];
-  }
-  const chunks: string[] = [];
-  const step = Math.max(1024, chunkSize - CHUNK_OVERLAP_CHARS);
-  for (let offset = 0; offset < text.length; offset += step) {
-    chunks.push(text.slice(offset, offset + chunkSize));
-    if (offset + chunkSize >= text.length) break;
-  }
-  return chunks;
+  return chunkWithOffsets(text, chunkSize).map((c) => c.chunk);
 }
 
 /** Builds a BLOCK verdict for exact secret matches without ever including the value. */
@@ -305,6 +333,11 @@ export function exactSecretVerdict(
   const where = first
     ? ` (${first.encoding} at offset ${first.start}${matches.length > 1 ? `, ${matches.length} matches` : ''})`
     : '';
+  const spans: MatchSpan[] = matches.map((m) => ({
+    category: m.category,
+    start: m.start,
+    end: m.end,
+  }));
   return {
     decision: 'BLOCK',
     source: 'ArmorCept Secrets',
@@ -313,6 +346,7 @@ export function exactSecretVerdict(
     findings: categories,
     score: 1,
     confidence: 1,
+    spans,
   };
 }
 
