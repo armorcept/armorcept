@@ -10,6 +10,8 @@
   },
   "scripts": {
     "test": "claude plugin test .",
+    "test:python": "python3 -I -m unittest discover -s tests -p 'test_*.py'",
+    "test:headless": "node scripts/headless/run-headless-test.mjs",
     "validate": "claude plugin validate .",
     "typecheck": "tsc -p .claude-plugin/types/tsconfig.json && tsc --noEmit",
     "daemon:stdio": "python3 python/daemon.py --mode stdio",

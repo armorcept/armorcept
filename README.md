@@ -144,6 +144,35 @@ If the Python engine can't produce a result, ArmorCept keeps protecting secrets 
 - **Circuit breaker:** after three failures in a row, ArmorCept stops calling the engine for 30 seconds and then tries it again, so a hung engine doesn't add a full timeout to every call.
 - **Visibility:** a toast and the status bar (`Degraded (engine unavailable — secrets only)`) show the outage, and recovery is announced. With `ARMORCEPT_DECISION_LOG` set, `engine.health` lines record `engine_unavailable` and `engine_recovered`.
 
+## Headless and Agent Runners
+
+ArmorCept works in headless Claude Code (`claude -p`, `--output-format stream-json`), which is how CI jobs and agent orchestrators run it. Nobody is there to see a toast or answer a dialog, so:
+
+- `$.ui.ask` overrides never happen. A block stays a block, and the model receives the deny message.
+- Toasts and the status bar go nowhere, so use the decision log to see what happened.
+
+Recommended `env` for an unattended runner:
+
+```json
+{
+  "env": {
+    "ARMORCEPT_MODE": "LOCAL",
+    "ARMORCEPT_DECISION_LOG": "/var/log/armorcept/decisions.jsonl",
+    "ARMORCEPT_ENFORCEMENT": "audit",
+    "ARMORCEPT_AUDIT_ENFORCE_SECRETS": "true",
+    "ARMORCEPT_SECRET_ENV_VARS": "GH_TOKEN,NPM_TOKEN,CLAUDE_CODE_OAUTH_TOKEN",
+    "ARMORCEPT_SCAN_TOOL_RESULTS": "true",
+    "ARMORCEPT_TOOL_RESULT_ACTION": "redact"
+  }
+}
+```
+
+Start in `audit` mode with secrets enforced, review the log (see [Measuring false positives](#measuring-false-positives-before-you-turn-blocking-on)), then switch `ARMORCEPT_ENFORCEMENT` to `enforce`. `redact` keeps long build and test logs useful to the agent when a secret appears in them. `LOCAL` keeps every payload on the runner. Set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` as well if the runner shouldn't make other outbound calls.
+
+**Expected latency.** With the warm worker, a scan adds single-digit milliseconds with the built-in engine (in CI, p50 around 4 ms and p95 around 25 ms) and typically under 30 ms with `prompt-armor`. The worker starts at `session.start`. Until it's ready (at most 3.5 s), calls use one-shot `stdio` scans, which take about 1.5–4 s each with `prompt-armor` installed. Result scanning (`ARMORCEPT_SCAN_TOOL_RESULTS`) adds a second scan per tool call.
+
+`npm run test:headless` runs real `claude -p` sessions with the plugin loaded against a local stub model (`scripts/headless/`). It checks that the worker starts, that a secret in a tool call is blocked, that one in a tool result is redacted or withheld, that exact env-var values and audit mode work, and that a clean session runs through. It needs no API key and makes no network calls; CI runs it on the pinned Claude Code version.
+
 ## Redacting Tool Results
 
 By default, one DLP hit withholds a whole tool result. With a long build or test log, that hides everything else, and an autonomous agent usually stalls or retries. Set `ARMORCEPT_TOOL_RESULT_ACTION=redact` to keep the result and blank out only the matches:
@@ -251,7 +280,10 @@ npm run validate
 npm test
 
 # Run the Python engine unit tests
-python3 -I -m unittest discover -s tests -p 'test_*.py'
+npm run test:python
+
+# Run headless claude -p sessions against a local stub model
+npm run test:headless
 ```
 
 ## Acknowledgments
