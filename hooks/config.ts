@@ -5,18 +5,29 @@
 import type { EngineInterface } from 'claude-code';
 import { resolvePythonBinary } from './engines';
 import { clearExactSecrets, readEnvValues, setExactSecrets } from './secrets';
-import type { ArmorCeptMode, LocalDlpAction, RuntimeConfig } from './types';
+import type {
+  ArmorCeptMode,
+  Enforcement,
+  LocalDlpAction,
+  RuntimeConfig,
+} from './types';
 
 let cachedConfig: RuntimeConfig | undefined;
 let lastKnownFailOpen = false;
+let lastKnownAudit = false;
 
 export function resetRuntimeConfigCache(): void {
   cachedConfig = undefined;
   lastKnownFailOpen = false;
+  lastKnownAudit = false;
 }
 
+/** Whether an unhandled hook error should let the action through (fail-open or audit mode). */
 export function getLastKnownFailOpen(): boolean {
-  return cachedConfig?.failOpen ?? lastKnownFailOpen;
+  if (cachedConfig) {
+    return cachedConfig.failOpen || cachedConfig.enforcement === 'audit';
+  }
+  return lastKnownFailOpen || lastKnownAudit;
 }
 
 export function stripQuotes(val: string | undefined): string | undefined {
@@ -96,6 +107,10 @@ export interface RawConfigEnv {
   ARMORCEPT_ALLOWLIST_PATHS?: string;
   ARMORCEPT_EXTRA_PATTERNS?: string;
   ARMORCEPT_SECRET_ENV_VARS?: string;
+  ARMORCEPT_ENFORCEMENT?: string;
+  ARMORCEPT_AUDIT_ENFORCE_SECRETS?: string;
+  ARMORCEPT_DECISION_LOG?: string;
+  ARMORCEPT_DECISION_LOG_MAX_BYTES?: string;
   GOOGLE_APPLICATION_CREDENTIALS?: string;
   GOOGLE_CLOUD_ACCESS_TOKEN?: string;
   GOOGLE_CLOUD_PROJECT?: string;
@@ -214,6 +229,30 @@ export function buildRuntimeConfig(
     sessionCwd
   );
 
+  const rawEnforcement = stripQuotes(raw.ARMORCEPT_ENFORCEMENT)?.toLowerCase();
+  let enforcement: Enforcement = 'enforce';
+  if (rawEnforcement) {
+    if (rawEnforcement === 'enforce' || rawEnforcement === 'audit') {
+      enforcement = rawEnforcement;
+    } else {
+      throw new Error(
+        `Invalid ARMORCEPT_ENFORCEMENT "${raw.ARMORCEPT_ENFORCEMENT}". Expected enforce or audit.`
+      );
+    }
+  }
+  lastKnownAudit = enforcement === 'audit';
+
+  const decisionLogMaxBytes = parseFiniteNumber(
+    raw.ARMORCEPT_DECISION_LOG_MAX_BYTES,
+    10 * 1024 * 1024,
+    'ARMORCEPT_DECISION_LOG_MAX_BYTES'
+  );
+  if (decisionLogMaxBytes < 0 || !Number.isInteger(decisionLogMaxBytes)) {
+    throw new Error(
+      'ARMORCEPT_DECISION_LOG_MAX_BYTES must be a non-negative whole number of bytes (0 disables rotation).'
+    );
+  }
+
   const secretEnvVars = parseCsvList(raw.ARMORCEPT_SECRET_ENV_VARS);
   for (const name of secretEnvVars) {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
@@ -233,6 +272,14 @@ export function buildRuntimeConfig(
   return {
     mode,
     failOpen,
+    enforcement,
+    auditEnforceSecrets: parseBool(raw.ARMORCEPT_AUDIT_ENFORCE_SECRETS, false),
+    decisionLogPath: resolveUserPath(
+      stripQuotes(raw.ARMORCEPT_DECISION_LOG),
+      rawHome,
+      sessionCwd
+    ),
+    decisionLogMaxBytes,
     promptArmorEndpoint: stripQuotes(raw.PROMPT_ARMOR_ENDPOINT) || 'stdio',
     promptArmorTimeoutMs,
     waterfallAllowBelow,
@@ -291,6 +338,10 @@ export async function readRuntimeConfig(
     rawAllowlistPaths,
     rawExtraPatterns,
     rawSecretEnvVars,
+    rawEnforcement,
+    rawAuditEnforceSecrets,
+    rawDecisionLog,
+    rawDecisionLogMaxBytes,
     rawGcpCreds,
     rawGcpToken,
     rawGcpProject,
@@ -314,6 +365,10 @@ export async function readRuntimeConfig(
     $.env.get('ARMORCEPT_ALLOWLIST_PATHS'),
     $.env.get('ARMORCEPT_EXTRA_PATTERNS'),
     $.env.get('ARMORCEPT_SECRET_ENV_VARS'),
+    $.env.get('ARMORCEPT_ENFORCEMENT'),
+    $.env.get('ARMORCEPT_AUDIT_ENFORCE_SECRETS'),
+    $.env.get('ARMORCEPT_DECISION_LOG'),
+    $.env.get('ARMORCEPT_DECISION_LOG_MAX_BYTES'),
     $.env.get('GOOGLE_APPLICATION_CREDENTIALS'),
     $.env.get('GOOGLE_CLOUD_ACCESS_TOKEN'),
     $.env.get('GOOGLE_CLOUD_PROJECT'),
@@ -379,6 +434,14 @@ export async function readRuntimeConfig(
         policyEnv['ARMORCEPT_EXTRA_PATTERNS'] ?? rawExtraPatterns,
       ARMORCEPT_SECRET_ENV_VARS:
         policyEnv['ARMORCEPT_SECRET_ENV_VARS'] ?? rawSecretEnvVars,
+      ARMORCEPT_ENFORCEMENT:
+        policyEnv['ARMORCEPT_ENFORCEMENT'] ?? rawEnforcement,
+      ARMORCEPT_AUDIT_ENFORCE_SECRETS:
+        policyEnv['ARMORCEPT_AUDIT_ENFORCE_SECRETS'] ?? rawAuditEnforceSecrets,
+      ARMORCEPT_DECISION_LOG:
+        policyEnv['ARMORCEPT_DECISION_LOG'] ?? rawDecisionLog,
+      ARMORCEPT_DECISION_LOG_MAX_BYTES:
+        policyEnv['ARMORCEPT_DECISION_LOG_MAX_BYTES'] ?? rawDecisionLogMaxBytes,
       GOOGLE_APPLICATION_CREDENTIALS:
         policyEnv['GOOGLE_APPLICATION_CREDENTIALS'] ?? rawGcpCreds,
       GOOGLE_CLOUD_ACCESS_TOKEN:

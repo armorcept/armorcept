@@ -28,7 +28,7 @@ Because ArmorCept inspects user prompts, tool arguments, and (optionally) tool o
 - **Hooks**: `session.start`, `prompt.submit` and `tool.call`. It can block a prompt or tool call, and withholds tool output when `ARMORCEPT_SCAN_TOOL_RESULTS=true`.
 - **Processes**: starts `python/daemon.py` (a localhost-only HTTP worker, or one-shot `stdio`). When `ARMORCEPT_SECRET_ENV_VARS` is set, it runs `printenv` (or `python3`) once per config load to read those variables. In `CLOUD`/`WATERFALL` mode it runs `scripts/mint-token.mjs` with `node` to mint an OAuth2 access token, which calls `gcloud` only when `ARMORCEPT_ALLOW_GCLOUD_ADC=true`.
 - **Network**: `127.0.0.1` for the local worker. In `CLOUD`/`WATERFALL` mode it also contacts your regional Model Armor endpoint and Google OAuth (see [Data Privacy & Network Flows](#data-privacy--network-flows)).
-- **Files and settings**: reads its own environment variables, the settings files, and the service account key at `GOOGLE_APPLICATION_CREDENTIALS`. It writes nothing outside the plugin directory.
+- **Files and settings**: reads its own environment variables, the settings files, the service account key at `GOOGLE_APPLICATION_CREDENTIALS`, and the `ARMORCEPT_EXTRA_PATTERNS` file. It writes only the decision log at `ARMORCEPT_DECISION_LOG` when that is set (through `python/decision_log.py`, or `sh` if Python is unavailable).
 
 ## Requirements
 
@@ -109,6 +109,10 @@ Configure ArmorCept in `.claude/settings.json` (or enterprise managed policy set
 | :--- | :--- | :--- |
 | `ARMORCEPT_MODE` | `WATERFALL` (with GCP config) or `LOCAL` | Execution mode: `LOCAL`, `CLOUD`, or `WATERFALL`. |
 | `ARMORCEPT_FAIL_OPEN` | `false` | When `false` (default), engine timeouts, crashes, or malformed responses block execution (fail-closed), including via `.catch` handlers on gating hooks. |
+| `ARMORCEPT_ENFORCEMENT` | `enforce` | `audit` records every verdict and never blocks or withholds. See [Audit mode and the decision log](#audit-mode-and-the-decision-log). |
+| `ARMORCEPT_AUDIT_ENFORCE_SECRETS` | `false` | In `audit` mode, keep blocking exact secret matches from `ARMORCEPT_SECRET_ENV_VARS`. |
+| `ARMORCEPT_DECISION_LOG` | *(unset)* | Path of a JSONL file that gets one line per verdict, in either enforcement mode (supports `~/` and session-relative paths). |
+| `ARMORCEPT_DECISION_LOG_MAX_BYTES` | `10485760` | Rotate the decision log to `<path>.1` (one old file kept) when it would grow past this size. `0` disables rotation. |
 | `ARMORCEPT_LOCAL_DLP_ACTION` | `block` | Action for pure local DLP regex matches (e.g., `DLP_US_SSN`, `SECRET_LEAK_AWS_ACCESS_KEY`) in `LOCAL` mode: `block`, `warn`, or `allow`. |
 | `ARMORCEPT_SCAN_TOOL_RESULTS` | `false` | When `true`, scans tool output after execution and withholds poisoned/sensitive results from the model (`{ deny }`). |
 | `ARMORCEPT_INTERACTIVE_OVERRIDE` | `false` | When `true` in `LOCAL` mode (or when explicitly enabled in enterprise managed policy), prompts the user via `$.ui.ask` to allow a blocked action once. |
@@ -129,6 +133,35 @@ Configure ArmorCept in `.claude/settings.json` (or enterprise managed policy set
 | `GOOGLE_CLOUD_LOCATION` | `us-central1` | Google Cloud region for Model Armor (`us-central1`, `europe-west1`, etc.). |
 | `MODEL_ARMOR_TEMPLATE_ID` | *(unset)* | Model Armor template ID configured with your SDP/DLP, PI/Jailbreak, and RAI filters. |
 | `MODEL_ARMOR_TIMEOUT_MS` | `5000` | Timeout in milliseconds for Google Cloud Model Armor requests. |
+
+## Audit Mode and the Decision Log
+
+`WARN` verdicts and blocks show up as toasts, which nobody sees in a headless (`claude -p`) run, in CI or under an agent runner. Two settings make ArmorCept's decisions visible there:
+
+- `ARMORCEPT_DECISION_LOG=<path>` appends one JSON line per verdict, for prompts, tool calls and tool results.
+- `ARMORCEPT_ENFORCEMENT=audit` records every verdict but never blocks or withholds anything, including on engine errors. Each would-be block shows an `[ArmorCept Audit — would block]` toast. With `ARMORCEPT_AUDIT_ENFORCE_SECRETS=true`, exact secret matches still block.
+
+A log line looks like this:
+
+```json
+{"ts":"2026-11-23T09:14:02.118Z","session":"5b0e…","hook":"tool.call","decision":"BLOCK","action":"audited","enforcement":"audit","mode":"LOCAL","source":"Prompt-Armor","engine":"Prompt-Armor (full)","categories":["PROMPT_INJECTION"],"tool":"Bash","score":0.97,"confidence":0.98,"latency_ms":24}
+```
+
+`decision` is what the engine recommended. `action` is what ArmorCept did: `allowed`, `warned`, `blocked`, `withheld`, `overridden` or `audited`. Lines never contain the payload, the matched text or a secret value. For engine errors, the categories hold only `ENGINE_ERROR`, and a short `error` field holds the error message with any loaded secret value redacted.
+
+Lines are buffered in memory and appended by a short-lived local process off the hook's critical path, then flushed at `session.end`. The file is created with mode `0600`.
+
+### Measuring false positives before you turn blocking on
+
+1. Run with `ARMORCEPT_ENFORCEMENT=audit` and `ARMORCEPT_DECISION_LOG` set, for a week of normal work or a few hundred CI runs.
+2. Review what would have been blocked:
+
+   ```bash
+   jq -c 'select(.action == "audited") | {hook, tool, source, categories, score}' armorcept.jsonl
+   jq -r 'select(.action == "audited") | .categories[]' armorcept.jsonl | sort | uniq -c | sort -rn
+   ```
+
+3. For each category, decide whether the hits were real. Then tune `WATERFALL_*` thresholds, `ARMORCEPT_LOCAL_DLP_ACTION`, `ARMORCEPT_EXEMPT_TOOLS` or `ARMORCEPT_ALLOWLIST_PATHS`, and switch to `enforce`. Keep the log on, so later blocks can be audited too.
 
 ## Secret Patterns
 

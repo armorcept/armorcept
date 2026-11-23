@@ -6,11 +6,21 @@ export type ArmorCeptMode = 'LOCAL' | 'CLOUD' | 'WATERFALL';
 
 export type LocalDlpAction = 'block' | 'warn' | 'allow';
 
+export type Enforcement = 'enforce' | 'audit';
+
 export type PromptArmorDecision = 'ALLOW' | 'WARN' | 'BLOCK' | 'ESCALATE';
 
 export interface RuntimeConfig {
   mode: ArmorCeptMode;
   failOpen: boolean;
+  /** audit: record every verdict, never block or withhold. */
+  enforcement: Enforcement;
+  /** In audit mode, still block exact secret matches (ARMORCEPT_SECRET_ENV_VARS). */
+  auditEnforceSecrets: boolean;
+  /** JSONL decision log path (ARMORCEPT_DECISION_LOG). */
+  decisionLogPath?: string;
+  /** Rotate the decision log to <path>.1 past this size; 0 disables rotation. */
+  decisionLogMaxBytes: number;
   promptArmorEndpoint: string;
   promptArmorTimeoutMs: number;
   waterfallAllowBelow: number;

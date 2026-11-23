@@ -28,6 +28,16 @@ import {
   isToolCallExempt,
   safeUi,
 } from './format';
+import {
+  buildDecisionRecord,
+  flushDecisionLog,
+  getSessionId,
+  isAuditBypassed,
+  recordDecision,
+  resetDecisionLogState,
+  type DecisionAction,
+  type DecisionHook,
+} from './decisions';
 import { evaluateArmorCept } from './orchestrator';
 import { getLoadedExactSecretNames } from './secrets';
 import type { EvaluationVerdict, RuntimeConfig } from './types';
@@ -69,9 +79,41 @@ async function maybeAskInteractiveOverride(
   return false;
 }
 
+async function logDecision(
+  $: EngineInterface,
+  cfg: RuntimeConfig | undefined,
+  hook: DecisionHook,
+  verdict: EvaluationVerdict,
+  action: DecisionAction,
+  latencyMs: number,
+  tool?: string
+): Promise<void> {
+  if (!cfg?.decisionLogPath) return;
+  try {
+    const session = await getSessionId($);
+    recordDecision(
+      $,
+      cfg,
+      buildDecisionRecord(cfg, { hook, tool, verdict, action, latencyMs, session })
+    );
+  } catch {
+    // Logging must never affect the security decision
+  }
+}
+
+function announceAudit(
+  $: EngineInterface,
+  verdict: EvaluationVerdict,
+  toolName?: string
+): void {
+  const banner = formatAlertBanner(verdict, toolName, { audit: true });
+  safeUi(() => $.ui.toast(banner, { timeoutMs: 5000 }));
+}
+
 export const register: Register = (on: On): void => {
   resetRuntimeConfigCache();
   resetEngineState();
+  resetDecisionLogState();
 
   on('session.start', async ($, e, next) => {
     try {
@@ -143,26 +185,43 @@ export const register: Register = (on: On): void => {
       // evaluateArmorCept will handle and report configuration errors according to failOpen
     }
 
+    const started = Date.now();
     const verdict = await evaluateArmorCept($, promptText);
+    const latencyMs = Date.now() - started;
 
     if (verdict.decision === 'BLOCK') {
-      const overridden = await maybeAskInteractiveOverride(
+      if (isAuditBypassed(cfg, verdict)) {
+        announceAudit($, verdict);
+        await logDecision($, cfg, 'prompt.submit', verdict, 'audited', latencyMs);
+      } else {
+        const overridden = await maybeAskInteractiveOverride(
+          $,
+          cfg,
+          verdict,
+          'prompt submission'
+        );
+        if (!overridden) {
+          const banner = formatAlertBanner(verdict);
+          safeUi(() => $.ui.status(`🛡️ ArmorCept: Blocked (${verdict.source})`));
+          safeUi(() => $.ui.toast(banner, { timeoutMs: 6000 }));
+          await logDecision($, cfg, 'prompt.submit', verdict, 'blocked', latencyMs);
+          return { drop: banner };
+        }
+        await logDecision($, cfg, 'prompt.submit', verdict, 'overridden', latencyMs);
+      }
+    } else {
+      if (verdict.decision === 'WARN') {
+        const warnBanner = formatAlertBanner(verdict);
+        safeUi(() => $.ui.toast(warnBanner, { timeoutMs: 5000 }));
+      }
+      await logDecision(
         $,
         cfg,
+        'prompt.submit',
         verdict,
-        'prompt submission'
+        verdict.decision === 'WARN' ? 'warned' : 'allowed',
+        latencyMs
       );
-      if (!overridden) {
-        const banner = formatAlertBanner(verdict);
-        safeUi(() => $.ui.status(`🛡️ ArmorCept: Blocked (${verdict.source})`));
-        safeUi(() => $.ui.toast(banner, { timeoutMs: 6000 }));
-        return { drop: banner };
-      }
-    }
-
-    if (verdict.decision === 'WARN') {
-      const warnBanner = formatAlertBanner(verdict);
-      safeUi(() => $.ui.toast(warnBanner, { timeoutMs: 5000 }));
     }
 
     safeUi(() =>
@@ -197,15 +256,23 @@ export const register: Register = (on: On): void => {
     const exempt = cfg ? isToolCallExempt(toolName, filePath, cfg) : false;
 
     if (!exempt) {
+      const started = Date.now();
       const verdict = await evaluateArmorCept($, serializedPayload);
+      const latencyMs = Date.now() - started;
+      let action: DecisionAction =
+        verdict.decision === 'WARN' ? 'warned' : 'allowed';
 
-      if (verdict.decision === 'BLOCK') {
+      if (verdict.decision === 'BLOCK' && isAuditBypassed(cfg, verdict)) {
+        announceAudit($, verdict, toolName);
+        action = 'audited';
+      } else if (verdict.decision === 'BLOCK') {
         const overridden = await maybeAskInteractiveOverride(
           $,
           cfg,
           verdict,
           `tool "${toolName}"`
         );
+        action = overridden ? 'overridden' : 'blocked';
         if (!overridden) {
           const banner = formatAlertBanner(verdict, toolName);
           const denyMessage = formatToolDenyMessage(verdict, toolName);
@@ -217,6 +284,7 @@ export const register: Register = (on: On): void => {
           if (typeof toolUseId === 'string' && toolUseId !== '') {
             safeUi(() => $.ui.notice(toolUseId, banner));
           }
+          await logDecision($, cfg, 'tool.call', verdict, 'blocked', latencyMs, toolName);
           return { deny: denyMessage };
         }
       }
@@ -225,6 +293,7 @@ export const register: Register = (on: On): void => {
         const warnBanner = formatAlertBanner(verdict, toolName);
         safeUi(() => $.ui.toast(warnBanner, { timeoutMs: 5000 }));
       }
+      await logDecision($, cfg, 'tool.call', verdict, action, latencyMs, toolName);
 
       safeUi(() =>
         $.ui.status(getStatusBadge(verdict.mode, verdict.engineMode))
@@ -251,7 +320,17 @@ export const register: Register = (on: On): void => {
               : JSON.stringify(resultRecord['result'])
             : '';
       if (resultText.trim().length > 0) {
+        const started = Date.now();
         const resultVerdict = await evaluateArmorCept($, resultText);
+        const latencyMs = Date.now() - started;
+        if (
+          resultVerdict.decision === 'BLOCK' &&
+          isAuditBypassed(cfg, resultVerdict)
+        ) {
+          announceAudit($, resultVerdict, `${toolName} output`);
+          await logDecision($, cfg, 'tool.result', resultVerdict, 'audited', latencyMs, toolName);
+          return toolResult;
+        }
         if (resultVerdict.decision === 'BLOCK') {
           const banner = formatAlertBanner(
             resultVerdict,
@@ -265,8 +344,18 @@ export const register: Register = (on: On): void => {
             $.ui.status(`🛡️ ArmorCept: Withheld (${resultVerdict.source})`)
           );
           safeUi(() => $.ui.toast(banner, { timeoutMs: 6000 }));
+          await logDecision($, cfg, 'tool.result', resultVerdict, 'withheld', latencyMs, toolName);
           return { deny: withholdMsg };
         }
+        await logDecision(
+          $,
+          cfg,
+          'tool.result',
+          resultVerdict,
+          resultVerdict.decision === 'WARN' ? 'warned' : 'allowed',
+          latencyMs,
+          toolName
+        );
       }
     }
 
@@ -286,6 +375,15 @@ export const register: Register = (on: On): void => {
     safeUi(() => $.ui.status('🛡️ ArmorCept: Blocked (Hook Error)'));
     safeUi(() => $.ui.toast(denyMessage, { timeoutMs: 6000 }));
     return { deny: denyMessage };
+  });
+
+  on('session.end', async ($, e, next) => {
+    try {
+      await flushDecisionLog();
+    } catch {
+      // Never hold up shutdown
+    }
+    return next(e);
   });
 };
 

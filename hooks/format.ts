@@ -35,7 +35,8 @@ export function getStatusBadge(
 
 export function formatAlertBanner(
   verdict: EvaluationVerdict,
-  toolName?: string
+  toolName?: string,
+  opts: { audit?: boolean } = {}
 ): string {
   const extraFindings = verdict.findings.filter((f) => f !== verdict.reason);
   const findingsSuffix =
@@ -50,7 +51,11 @@ export function formatAlertBanner(
         })`
       : '';
   const targetPrefix = toolName ? `Tool (${toolName}) — ` : '';
-  const actionLabel = verdict.decision === 'WARN' ? 'Warning' : 'Blocked';
+  const actionLabel = opts.audit
+    ? 'Audit — would block'
+    : verdict.decision === 'WARN'
+      ? 'Warning'
+      : 'Blocked';
   return `🛡️ [ArmorCept ${actionLabel}] Source: ${verdict.source} | Reason: ${targetPrefix}${verdict.reason}${findingsSuffix}${scoreSuffix}`;
 }
 
