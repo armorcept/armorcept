@@ -7,6 +7,8 @@ import {
   setExactSecrets,
 } from '../hooks/secrets';
 import { applyRedactions, mergeSpans } from '../hooks/redact';
+import { scanFallbackDlp } from '../hooks/dlp';
+import { DLP_CASES } from './fixtures/dlpCases';
 import { parsePromptArmorJson } from '../hooks/engines';
 import {
   extractToolPayload,
@@ -714,7 +716,7 @@ describe('ArmorCept — Sandbox Hook Pipeline Integration Tests', () => {
     });
     expect(failClosedCall.deny).toBeDefined();
     expect(failClosedCall.deny).toContain(
-      'EngineError: prompt-armor daemon exited 1'
+      'ArmorCept engine unavailable (prompt-armor daemon exited 1'
     );
 
     // Poisoned tool output is withheld after execution when ARMORCEPT_SCAN_TOOL_RESULTS=true
@@ -1503,5 +1505,171 @@ describe('ArmorCept — Tool result redaction (ARMORCEPT_TOOL_RESULT_ACTION=reda
     expect((res.result as { output: string }).output).toBe(
       `HOME=/root\nRUNNER_TOKEN=[REDACTED:SECRET_EXACT_RUNNER_TOKEN]\nKEY=${LABEL}\n`
     );
+  });
+});
+
+describe('ArmorCept — In-process DLP fallback when the Python engine cannot run', () => {
+  const KEY = `AKIA${'Q1W2E3R4T5Y6U7I8'}`;
+
+  test('hooks/dlp.ts agrees with python/daemon.py on the shared fixtures', () => {
+    const fill = (n: number, alphabet: string) =>
+      alphabet.repeat(Math.ceil(n / alphabet.length) + 1).slice(0, n);
+    expect(DLP_CASES.length).toBeGreaterThan(20);
+    for (const c of DLP_CASES) {
+      const text = `${c.prefix}${fill(c.n, c.alphabet)}${'suffix' in c ? c.suffix : ''}`;
+      const found = scanFallbackDlp(text).findings.includes(c.category);
+      if (found !== c.hit) {
+        throw new Error(`fallback mismatch for ${c.category} (${c.prefix}…): expected hit=${c.hit}`);
+      }
+    }
+    const spans = scanFallbackDlp(`a ${KEY} b ${KEY}`).dlpSpans ?? [];
+    expect(spans.map((s) => [s.start, s.end])).toEqual([
+      [2, 22],
+      [25, 45],
+    ]);
+  });
+
+  type Failure = 'missing' | 'crash' | 'timeout';
+  function failingEngine(
+    on: Parameters<typeof mock.env>[0],
+    failure: Failure
+  ): { engineCalls: () => number; logLines: () => Record<string, unknown>[] } {
+    let calls = 0;
+    const logs: string[] = [];
+    on('process.run', ($, e) => {
+      if (e.argv.some((a) => a.endsWith('decision_log.py'))) {
+        logs.push(e.init?.stdin ?? '');
+        return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } };
+      }
+      calls += 1;
+      if (failure === 'missing') {
+        // What a shell reports for a missing interpreter
+        return {
+          value: {
+            exitCode: 127,
+            stdout: '',
+            stderr: 'sh: 1: python3: not found',
+            isStdoutTruncated: false,
+            isStderrTruncated: false,
+          },
+        };
+      }
+      if (failure === 'timeout') {
+        // The runtime rejects a run that outlives timeoutMs
+        return Promise.reject(new Error('aborted: still running after 5000ms'));
+      }
+      return {
+        value: {
+          exitCode: 1,
+          stdout: '',
+          stderr: 'Traceback (most recent call last):\n  ImportError: prompt_armor crashed on import',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      };
+    });
+    on('process.spawn', async function* () {
+      throw new Error('spawn python3 ENOENT');
+    });
+    return {
+      engineCalls: () => calls,
+      logLines: () =>
+        logs
+          .flatMap((b) => b.split('\n'))
+          .filter((l) => l.trim() !== '')
+          .map((l) => JSON.parse(l) as Record<string, unknown>),
+    };
+  }
+
+  for (const failure of ['missing', 'crash', 'timeout'] as const) {
+    test(`fail-closed, engine ${failure}: secrets blocked, clean calls blocked with a clear engine message`, async ($, on) => {
+      const { toasts } = registerBaseMocks(on, { ARMORCEPT_MODE: 'LOCAL' });
+      failingEngine(on, failure);
+
+      const secret = await $.tool.call({ tool: 'Bash', command: `aws --key ${KEY}` });
+      expect(secret.deny).toContain('SECRET_LEAK_AWS_ACCESS_KEY');
+      expect(secret.deny).toContain('ArmorCept DLP');
+
+      const clean = await $.tool.call({ tool: 'Bash', command: 'ls -la' });
+      expect(clean.deny).toBeDefined();
+      expect(toasts.some((t) => t.includes('ArmorCept engine unavailable ('))).toBe(true);
+      // The test harness reports any rejected mock as "no implementation for
+      // process.run"; the real runtime rejects with "aborted: still running…".
+      const expected =
+        failure === 'missing'
+          ? 'python3: not found'
+          : failure === 'timeout'
+            ? 'EngineError: no implementation for process.run'
+            : 'exited 1';
+      expect(clean.deny).toContain('ArmorCept engine unavailable (');
+      expect(clean.deny).toContain('not a security finding');
+      expect(toasts.join('\n')).toContain(expected);
+      const blockToasts = toasts.filter((t) => t.includes('[ArmorCept Blocked]'));
+      expect(blockToasts[blockToasts.length - 1]).toContain('ArmorCept engine unavailable (');
+    });
+
+    test(`fail-open, engine ${failure}: secrets still blocked, clean calls allowed`, async ($, on) => {
+      registerBaseMocks(on, { ARMORCEPT_MODE: 'LOCAL', ARMORCEPT_FAIL_OPEN: 'true' });
+      failingEngine(on, failure);
+
+      const secret = await $.tool.call({ tool: 'Bash', command: `aws --key ${KEY}` });
+      expect(secret.deny).toContain('SECRET_LEAK_AWS_ACCESS_KEY');
+
+      const clean = await $.tool.call({ tool: 'Bash', command: 'ls -la' });
+      expect(clean.deny).toBeUndefined();
+    });
+  }
+
+  test('circuit breaker stops calling a failing engine and logs health events', async ($, on) => {
+    registerBaseMocks(on, {
+      ARMORCEPT_MODE: 'LOCAL',
+      ARMORCEPT_DECISION_LOG: '/tmp/armorcept-test.jsonl',
+    });
+    const engine = failingEngine(on, 'crash');
+    for (let i = 0; i < 6; i += 1) {
+      const res = await $.tool.call({ tool: 'Bash', command: `echo ${i}` });
+      expect(res.deny).toContain('ArmorCept engine unavailable (');
+    }
+    // Three failures open the breaker; the remaining calls skip the engine.
+    expect(engine.engineCalls()).toBe(3);
+    for (let i = 0; i < 3; i += 1) {
+      await $.prompt.submit({ text: 'tick', wait: false, origin: { kind: 'composer' } });
+    }
+    const health = engine.logLines().filter((r) => r['hook'] === 'engine.health');
+    expect(health.length).toBe(1);
+    expect(health[0]).toMatchObject({ event: 'engine_unavailable', decision: 'INFO' });
+    expect(String(health[0]?.['error'])).toContain('exited 1');
+  });
+
+  test('WATERFALL sends injection checks to Model Armor while the local engine is down', async ($, on) => {
+    registerBaseMocks(on, {
+      ARMORCEPT_MODE: 'WATERFALL',
+      GOOGLE_CLOUD_PROJECT: 'demo-sec-proj',
+      MODEL_ARMOR_TEMPLATE_ID: 'enterprise-armor',
+      GOOGLE_CLOUD_ACCESS_TOKEN: 'ya29.static_token',
+    });
+    failingEngine(on, 'crash');
+    let cloudCalls = 0;
+    on('http.fetch', () => {
+      cloudCalls += 1;
+      return {
+        value: {
+          status: 200,
+          ok: true,
+          headers: {},
+          text: JSON.stringify({
+            sanitizationResult: { filterMatchState: 'NO_MATCH_FOUND', filterResults: {} },
+          }),
+        },
+      };
+    });
+
+    const clean = await $.tool.call({ tool: 'Bash', command: 'ls -la' });
+    expect(clean.deny).toBeUndefined();
+    expect(cloudCalls).toBe(1);
+
+    const secret = await $.tool.call({ tool: 'Bash', command: `aws --key ${KEY}` });
+    expect(secret.deny).toContain('SECRET_LEAK_AWS_ACCESS_KEY');
+    expect(cloudCalls).toBe(1);
   });
 });

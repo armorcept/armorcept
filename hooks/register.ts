@@ -38,7 +38,7 @@ import {
   type DecisionAction,
   type DecisionHook,
 } from './decisions';
-import { evaluateArmorCept } from './orchestrator';
+import { evaluateArmorCept, resetFallbackState } from './orchestrator';
 import { isRedactable, redactText } from './redact';
 import { getLoadedExactSecretNames } from './secrets';
 import type { EvaluationVerdict, RuntimeConfig } from './types';
@@ -161,6 +161,7 @@ export const register: Register = (on: On): void => {
   resetRuntimeConfigCache();
   resetEngineState();
   resetDecisionLogState();
+  resetFallbackState();
 
   on('session.start', async ($, e, next) => {
     try {

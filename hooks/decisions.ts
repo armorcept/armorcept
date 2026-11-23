@@ -110,6 +110,29 @@ export function buildDecisionRecord(
   return record;
 }
 
+export function buildHealthRecord(
+  cfg: RuntimeConfig,
+  event: 'engine_unavailable' | 'engine_recovered',
+  error: string | undefined,
+  session?: string
+): DecisionRecord {
+  const record: DecisionRecord = {
+    ts: new Date().toISOString(),
+    hook: 'engine.health',
+    event,
+    decision: 'INFO',
+    action: 'info',
+    enforcement: cfg.enforcement,
+    mode: cfg.mode,
+    source: 'ArmorCept',
+    categories: [],
+    latency_ms: 0,
+  };
+  if (session) record.session = session;
+  if (error) record.error = scrubError(error);
+  return record;
+}
+
 let buffer: string[] = [];
 let chain: Promise<void> = Promise.resolve();
 let sessionId: string | undefined;

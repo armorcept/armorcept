@@ -108,6 +108,37 @@ class BuiltinPatternTests(unittest.TestCase):
         self.assertEqual(categories(self.engine, "npm install && git push origin main"), set())
 
 
+def load_shared_cases() -> list[dict]:
+    """Reads tests/fixtures/dlpCases.ts, whose exported value is plain JSON."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "dlpCases.ts")
+    with open(path, encoding="utf-8") as fh:
+        source = fh.read()
+    body = source.split("export const DLP_CASES = ", 1)[1].rsplit(";", 1)[0]
+    return json.loads(body)
+
+
+def build_case(case: dict) -> str:
+    return case["prefix"] + fake("", case["n"], case["alphabet"]) + case.get("suffix", "")
+
+
+class SharedFixtureTests(unittest.TestCase):
+    """The same fixtures run against hooks/dlp.ts in tests/register.test.ts."""
+
+    def test_shared_dlp_cases(self) -> None:
+        engine = daemon.WarmPromptArmorEngine()
+        cases = load_shared_cases()
+        self.assertGreater(len(cases), 20)
+        for case in cases:
+            text = build_case(case)
+            with self.subTest(prefix=case["prefix"], hit=case["hit"]):
+                found = case["category"] in categories(engine, text)
+                self.assertEqual(found, case["hit"])
+
+    def test_every_builtin_category_has_a_shared_case(self) -> None:
+        covered = {c["category"] for c in load_shared_cases() if c["hit"]}
+        self.assertEqual(covered, {p.category for p in daemon.BUILTIN_DLP_PATTERNS})
+
+
 class SpanTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = daemon.WarmPromptArmorEngine()

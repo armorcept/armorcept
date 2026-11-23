@@ -10,6 +10,13 @@ export type Enforcement = 'enforce' | 'audit';
 
 export type ToolResultAction = 'withhold' | 'redact';
 
+/**
+ * full: prompt-armor; lightweight_fallback: the daemon's built-in regex engine
+ * (prompt-armor not installed); ts-fallback: the in-process DLP patterns, used
+ * when the Python engine can't run at all.
+ */
+export type EngineMode = 'full' | 'lightweight_fallback' | 'ts-fallback';
+
 /** A matched span in a scanned text, as UTF-16 offsets (JavaScript string indices). */
 export interface MatchSpan {
   category: string;
@@ -65,7 +72,7 @@ export interface PromptArmorResult {
   /** Where each DLP match is in the scanned text. */
   dlpSpans?: MatchSpan[];
   latency_ms?: number;
-  engine_mode?: 'full' | 'lightweight_fallback';
+  engine_mode?: EngineMode;
   warning?: string;
 }
 
@@ -84,7 +91,7 @@ export interface EvaluationVerdict {
   score?: number;
   confidence?: number;
   escalatedToCloud?: boolean;
-  engineMode?: 'full' | 'lightweight_fallback';
+  engineMode?: EngineMode;
   warning?: string;
   /** Match spans for DLP and secret findings, when the engine knows them. */
   spans?: MatchSpan[];

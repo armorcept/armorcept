@@ -108,7 +108,7 @@ Configure ArmorCept in `.claude/settings.json` (or enterprise managed policy set
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `ARMORCEPT_MODE` | `WATERFALL` (with GCP config) or `LOCAL` | Execution mode: `LOCAL`, `CLOUD`, or `WATERFALL`. |
-| `ARMORCEPT_FAIL_OPEN` | `false` | When `false` (default), engine timeouts, crashes, or malformed responses block execution (fail-closed), including via `.catch` handlers on gating hooks. |
+| `ARMORCEPT_FAIL_OPEN` | `false` | When `false` (default), engine timeouts, crashes, or malformed responses block execution (fail-closed), including via `.catch` handlers on gating hooks. When the local engine can't run, secrets are still checked in-process whatever this says; see [When the engine can't run](#when-the-engine-cant-run). |
 | `ARMORCEPT_ENFORCEMENT` | `enforce` | `audit` records every verdict and never blocks or withholds. See [Audit mode and the decision log](#audit-mode-and-the-decision-log). |
 | `ARMORCEPT_AUDIT_ENFORCE_SECRETS` | `false` | In `audit` mode, keep blocking exact secret matches from `ARMORCEPT_SECRET_ENV_VARS`. |
 | `ARMORCEPT_DECISION_LOG` | *(unset)* | Path of a JSONL file that gets one line per verdict, in either enforcement mode (supports `~/` and session-relative paths). |
@@ -134,6 +134,15 @@ Configure ArmorCept in `.claude/settings.json` (or enterprise managed policy set
 | `GOOGLE_CLOUD_LOCATION` | `us-central1` | Google Cloud region for Model Armor (`us-central1`, `europe-west1`, etc.). |
 | `MODEL_ARMOR_TEMPLATE_ID` | *(unset)* | Model Armor template ID configured with your SDP/DLP, PI/Jailbreak, and RAI filters. |
 | `MODEL_ARMOR_TIMEOUT_MS` | `5000` | Timeout in milliseconds for Google Cloud Model Armor requests. |
+
+## When the Engine Can't Run
+
+If the Python engine can't produce a result, ArmorCept keeps protecting secrets instead of failing every call. That covers a missing `python3`, a broken venv, `prompt-armor` crashing on import, and scans timing out.
+
+- **Secrets:** the built-in secret and DLP patterns run in-process (`hooks/dlp.ts`), as do exact matches from `ARMORCEPT_SECRET_ENV_VARS`. They block as usual, with `engine_mode: "ts-fallback"`. Custom `ARMORCEPT_EXTRA_PATTERNS` are Python regexes, so they need the engine.
+- **Injection:** in `WATERFALL` mode, injection checks go to Model Armor. In `LOCAL` mode they follow `ARMORCEPT_FAIL_OPEN`. Fail-closed (the default) blocks with `ArmorCept engine unavailable (<reason>)`, and the message tells the model this is not a security finding. Fail-open allows the action.
+- **Circuit breaker:** after three failures in a row, ArmorCept stops calling the engine for 30 seconds and then tries it again, so a hung engine doesn't add a full timeout to every call.
+- **Visibility:** a toast and the status bar (`Degraded (engine unavailable — secrets only)`) show the outage, and recovery is announced. With `ARMORCEPT_DECISION_LOG` set, `engine.health` lines record `engine_unavailable` and `engine_recovered`.
 
 ## Redacting Tool Results
 

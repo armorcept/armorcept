@@ -2,7 +2,12 @@
  * ArmorCept — Formatting, Safe UI Helpers, and Payload Serialization
  */
 
-import type { ArmorCeptMode, EvaluationVerdict, RuntimeConfig } from './types';
+import type {
+  ArmorCeptMode,
+  EngineMode,
+  EvaluationVerdict,
+  RuntimeConfig,
+} from './types';
 
 const RESERVED_TOOL_ENVELOPE_KEYS = new Set([
   'tool',
@@ -23,8 +28,11 @@ export function safeUi(fn: () => unknown): void {
 
 export function getStatusBadge(
   mode: ArmorCeptMode,
-  engineMode?: 'full' | 'lightweight_fallback'
+  engineMode?: EngineMode
 ): string {
+  if (engineMode === 'ts-fallback') {
+    return '🛡️ ArmorCept: Degraded (engine unavailable — secrets only)';
+  }
   if (engineMode === 'lightweight_fallback') {
     return '🛡️ ArmorCept: Active (Local - Lightweight Test Mode)';
   }
@@ -59,10 +67,18 @@ export function formatAlertBanner(
   return `🛡️ [ArmorCept ${actionLabel}] Source: ${verdict.source} | Reason: ${targetPrefix}${verdict.reason}${findingsSuffix}${scoreSuffix}`;
 }
 
+/** True when the block is an engine outage, not a security finding. */
+export function isEngineOutage(verdict: EvaluationVerdict): boolean {
+  return verdict.source === 'ArmorCept' && verdict.engineMode === 'ts-fallback';
+}
+
 export function formatToolDenyMessage(
   verdict: EvaluationVerdict,
   toolName: string
 ): string {
+  if (isEngineOutage(verdict)) {
+    return `Tool execution blocked for tool "${toolName}": ${verdict.reason}. This is not a security finding: ArmorCept could not scan the call and is failing closed. Secret checks still run; retry once the engine recovers, or ask the operator to check the ArmorCept install.`;
+  }
   const details =
     verdict.findings.length > 0
       ? verdict.findings.join(', ')
@@ -74,6 +90,9 @@ export function formatToolResultWithheldMessage(
   verdict: EvaluationVerdict,
   toolName: string
 ): string {
+  if (isEngineOutage(verdict)) {
+    return `Tool "${toolName}" output withheld: ${verdict.reason}. This is not a security finding: ArmorCept could not scan the output and is failing closed.`;
+  }
   const details =
     verdict.findings.length > 0
       ? verdict.findings.join(', ')

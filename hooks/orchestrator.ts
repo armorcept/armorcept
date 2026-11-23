@@ -5,7 +5,13 @@
 import type { EngineInterface } from 'claude-code';
 import { getLastKnownFailOpen, readRuntimeConfig } from './config';
 import { runModelArmor, runPromptArmor } from './engines';
-import { safeUi } from './format';
+import {
+  buildHealthRecord,
+  getSessionId,
+  recordDecision,
+} from './decisions';
+import { scanFallbackDlp } from './dlp';
+import { getStatusBadge, safeUi } from './format';
 import { findExactSecrets, type SecretMatch } from './secrets';
 import type {
   ArmorCeptMode,
@@ -242,7 +248,12 @@ async function evaluateText(
     return await runCloudPass($, text, cfg, false);
   }
 
-  const local = await runLocalPass($, text, cfg);
+  let local: PromptArmorResult;
+  try {
+    local = await runGuardedLocalPass($, text, cfg);
+  } catch (err) {
+    return await engineUnavailableVerdict($, text, cfg, err);
+  }
 
   if (cfg.mode === 'LOCAL') {
     return evaluateLocalVerdict(local, cfg);
@@ -298,6 +309,177 @@ async function evaluateText(
   }
 
   return await runCloudPass($, text, cfg, true);
+}
+
+// ---------------------------------------------------------------------------
+// Engine health, circuit breaker and the in-process fallback (#5)
+// ---------------------------------------------------------------------------
+
+/** Consecutive local-engine failures that open the circuit breaker. */
+const BREAKER_THRESHOLD = 3;
+/** How long the breaker skips the engine before trying it again. */
+const BREAKER_COOLDOWN_MS = 30_000;
+
+let engineHealthy = true;
+let consecutiveEngineFailures = 0;
+let breakerOpenUntilMs = 0;
+let lastEngineFailure = '';
+
+export function resetFallbackState(): void {
+  engineHealthy = true;
+  consecutiveEngineFailures = 0;
+  breakerOpenUntilMs = 0;
+  lastEngineFailure = '';
+}
+
+export class EngineUnavailableError extends Error {}
+
+/** A short, single-line reason, scrubbed of any loaded secret value. */
+function shortReason(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  const firstLine = message.split('\n').find((l) => l.trim() !== '') ?? message;
+  let reason = firstLine.trim().slice(0, 160);
+  for (const hit of findExactSecrets(reason).reverse()) {
+    reason = `${reason.slice(0, hit.start)}[REDACTED:${hit.category}]${reason.slice(hit.end)}`;
+  }
+  return reason || 'unknown error';
+}
+
+async function logHealth(
+  $: EngineInterface,
+  cfg: RuntimeConfig,
+  event: 'engine_unavailable' | 'engine_recovered',
+  reason?: string
+): Promise<void> {
+  if (!cfg.decisionLogPath) return;
+  try {
+    recordDecision($, cfg, buildHealthRecord(cfg, event, reason, await getSessionId($)));
+  } catch {
+    // Health logging never affects a decision
+  }
+}
+
+async function noteEngineFailure(
+  $: EngineInterface,
+  cfg: RuntimeConfig,
+  reason: string
+): Promise<void> {
+  consecutiveEngineFailures += 1;
+  lastEngineFailure = reason;
+  if (consecutiveEngineFailures >= BREAKER_THRESHOLD) {
+    breakerOpenUntilMs = Date.now() + BREAKER_COOLDOWN_MS;
+  }
+  if (engineHealthy) {
+    engineHealthy = false;
+    const injection =
+      cfg.mode === 'WATERFALL'
+        ? 'injection scanning continues in Model Armor'
+        : cfg.failOpen
+          ? 'injection scanning is skipped (ARMORCEPT_FAIL_OPEN=true)'
+          : 'other actions are blocked until it recovers';
+    safeUi(() =>
+      $.ui.toast(
+        `⚠️ ArmorCept engine unavailable (${reason}). Secret checks continue in-process; ${injection}.`,
+        { timeoutMs: 8000 }
+      )
+    );
+    safeUi(() => $.ui.status(getStatusBadge(cfg.mode, 'ts-fallback')));
+    await logHealth($, cfg, 'engine_unavailable', reason);
+  }
+}
+
+async function noteEngineSuccess($: EngineInterface, cfg: RuntimeConfig): Promise<void> {
+  consecutiveEngineFailures = 0;
+  breakerOpenUntilMs = 0;
+  if (!engineHealthy) {
+    engineHealthy = true;
+    lastEngineFailure = '';
+    safeUi(() => $.ui.toast('🛡️ ArmorCept engine recovered', { timeoutMs: 4000 }));
+    await logHealth($, cfg, 'engine_recovered');
+  }
+}
+
+async function runGuardedLocalPass(
+  $: EngineInterface,
+  text: string,
+  cfg: RuntimeConfig
+): Promise<PromptArmorResult> {
+  if (Date.now() < breakerOpenUntilMs) {
+    throw new EngineUnavailableError(
+      `${lastEngineFailure || 'repeated failures'}; ${consecutiveEngineFailures} failures in a row, retrying in ${Math.ceil(
+        (breakerOpenUntilMs - Date.now()) / 1000
+      )}s`
+    );
+  }
+  try {
+    const local = await runLocalPass($, text, cfg);
+    await noteEngineSuccess($, cfg);
+    return local;
+  } catch (err) {
+    await noteEngineFailure($, cfg, shortReason(err));
+    throw err;
+  }
+}
+
+/**
+ * The Python engine couldn't produce a result. Secrets are still checked with
+ * the in-process patterns; injection goes to Model Armor in WATERFALL mode,
+ * and otherwise follows ARMORCEPT_FAIL_OPEN.
+ */
+async function engineUnavailableVerdict(
+  $: EngineInterface,
+  text: string,
+  cfg: RuntimeConfig,
+  err: unknown
+): Promise<EvaluationVerdict> {
+  const reason = shortReason(err);
+  const unavailable = `ArmorCept engine unavailable (${reason})`;
+
+  const dlp: PromptArmorResult = { ...scanFallbackDlp(text), engine_mode: 'ts-fallback' };
+  let dlpVerdict: EvaluationVerdict | undefined;
+  if (dlp.findings.length > 0) {
+    dlpVerdict = {
+      ...evaluateLocalVerdict(dlp, cfg),
+      mode: cfg.mode,
+      source: 'ArmorCept DLP',
+      engineMode: 'ts-fallback',
+      warning: unavailable,
+    };
+    if (dlpVerdict.decision === 'BLOCK') {
+      return dlpVerdict;
+    }
+  }
+
+  if (cfg.mode === 'WATERFALL') {
+    const cloud = await runCloudPass($, text, cfg, true);
+    return { ...cloud, engineMode: 'ts-fallback', warning: unavailable };
+  }
+
+  if (cfg.failOpen) {
+    if (dlpVerdict) {
+      return { ...dlpVerdict, reason: `${dlpVerdict.reason}; ${unavailable}` };
+    }
+    return {
+      decision: 'ALLOW',
+      source: 'ArmorCept',
+      mode: cfg.mode,
+      reason: `${unavailable}; injection scanning skipped (ARMORCEPT_FAIL_OPEN=true)`,
+      findings: [],
+      engineMode: 'ts-fallback',
+      warning: unavailable,
+    };
+  }
+
+  const message = err instanceof Error ? err.message : String(err);
+  return {
+    decision: 'BLOCK',
+    source: 'ArmorCept',
+    mode: cfg.mode,
+    reason: unavailable,
+    findings: [`EngineError: ${shortReason(message)}`],
+    engineMode: 'ts-fallback',
+    warning: unavailable,
+  };
 }
 
 export function chunkWithOffsets(
