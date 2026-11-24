@@ -4,11 +4,19 @@
 
 import type { EngineInterface } from 'claude-code';
 import { getLastKnownFailOpen, readRuntimeConfig } from './config';
-import { runModelArmor, runPromptArmor } from './engines';
-import { safeUi } from './format';
+import { EngineSpawnError, runModelArmor, runPromptArmor } from './engines';
+import {
+  buildHealthRecord,
+  getSessionId,
+  recordDecision,
+} from './decisions';
+import { scanFallbackDlp } from './dlp';
+import { getStatusBadge, safeUi } from './format';
+import { findExactSecrets, type SecretMatch } from './secrets';
 import type {
   ArmorCeptMode,
   EvaluationVerdict,
+  MatchSpan,
   PromptArmorDecision,
   PromptArmorResult,
   RuntimeConfig,
@@ -59,6 +67,7 @@ export function evaluateLocalVerdict(
         confidence: local.confidence,
         engineMode: local.engine_mode,
         warning: local.warning,
+        spans: local.dlpSpans,
       };
     }
     if (cfg.localDlpAction === 'warn') {
@@ -72,6 +81,7 @@ export function evaluateLocalVerdict(
         confidence: local.confidence,
         engineMode: local.engine_mode,
         warning: local.warning,
+        spans: local.dlpSpans,
       };
     }
   }
@@ -92,6 +102,7 @@ export function evaluateLocalVerdict(
       confidence: local.confidence,
       engineMode: local.engine_mode,
       warning: local.warning,
+      spans: local.dlpSpans,
     };
   }
 
@@ -113,6 +124,7 @@ export function evaluateLocalVerdict(
       confidence: local.confidence,
       engineMode: local.engine_mode,
       warning: local.warning,
+      spans: local.dlpSpans,
     };
   }
 
@@ -126,6 +138,7 @@ export function evaluateLocalVerdict(
     confidence: local.confidence,
     engineMode: local.engine_mode,
     warning: local.warning,
+    spans: local.dlpSpans,
   };
 }
 
@@ -157,6 +170,7 @@ function mergeLocalResults(
     dlpCategories: Array.from(
       new Set([...a.dlpCategories, ...b.dlpCategories])
     ),
+    dlpSpans: [...(a.dlpSpans ?? []), ...(b.dlpSpans ?? [])],
     latency_ms: (a.latency_ms ?? 0) + (b.latency_ms ?? 0),
     engine_mode: lightweight
       ? 'lightweight_fallback'
@@ -178,8 +192,20 @@ async function runLocalPass(
   cfg: RuntimeConfig
 ): Promise<PromptArmorResult> {
   let merged: PromptArmorResult | undefined;
-  for (const chunk of splitIntoChunks(text, MAX_LOCAL_SCAN_CHUNK_CHARS)) {
-    const result = await runPromptArmor($, chunk, cfg);
+  for (const { chunk, offset } of chunkWithOffsets(
+    text,
+    MAX_LOCAL_SCAN_CHUNK_CHARS
+  )) {
+    const raw = await runPromptArmor($, chunk, cfg);
+    // Chunk-relative spans become offsets into the whole text
+    const result: PromptArmorResult = {
+      ...raw,
+      dlpSpans: (raw.dlpSpans ?? []).map((s) => ({
+        ...s,
+        start: s.start + offset,
+        end: s.end + offset,
+      })),
+    };
     merged = mergeLocalResults(merged, result);
     const decisive =
       cfg.mode === 'LOCAL' || result.confidence >= cfg.waterfallMinConfidence;
@@ -222,7 +248,12 @@ async function evaluateText(
     return await runCloudPass($, text, cfg, false);
   }
 
-  const local = await runLocalPass($, text, cfg);
+  let local: PromptArmorResult;
+  try {
+    local = await runGuardedLocalPass($, text, cfg);
+  } catch (err) {
+    return await engineUnavailableVerdict($, text, cfg, err);
+  }
 
   if (cfg.mode === 'LOCAL') {
     return evaluateLocalVerdict(local, cfg);
@@ -252,6 +283,7 @@ async function evaluateText(
       escalatedToCloud: false,
       engineMode: local.engine_mode,
       warning: local.warning,
+      spans: local.dlpSpans,
     };
   }
 
@@ -272,26 +304,257 @@ async function evaluateText(
       escalatedToCloud: false,
       engineMode: local.engine_mode,
       warning: local.warning,
+      spans: local.dlpSpans,
     };
   }
 
   return await runCloudPass($, text, cfg, true);
 }
 
+// ---------------------------------------------------------------------------
+// Engine health, circuit breaker and the in-process fallback (#5)
+// ---------------------------------------------------------------------------
+
+/** Consecutive local-engine failures that open the circuit breaker. */
+const BREAKER_THRESHOLD = 3;
+/** How long the breaker skips the engine before trying it again. */
+const BREAKER_COOLDOWN_MS = 30_000;
+
+let engineHealthy = true;
+let consecutiveEngineFailures = 0;
+let breakerOpenUntilMs = 0;
+let lastEngineFailure = '';
+
+export function resetFallbackState(): void {
+  engineHealthy = true;
+  consecutiveEngineFailures = 0;
+  breakerOpenUntilMs = 0;
+  lastEngineFailure = '';
+}
+
+export class EngineUnavailableError extends Error {}
+
+/** A short, single-line reason, scrubbed of any loaded secret value. */
+function shortReason(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  const firstLine = message.split('\n').find((l) => l.trim() !== '') ?? message;
+  let reason = firstLine.trim().slice(0, 160);
+  for (const hit of findExactSecrets(reason).reverse()) {
+    reason = `${reason.slice(0, hit.start)}[REDACTED:${hit.category}]${reason.slice(hit.end)}`;
+  }
+  return reason || 'unknown error';
+}
+
+async function logHealth(
+  $: EngineInterface,
+  cfg: RuntimeConfig,
+  event: 'engine_unavailable' | 'engine_recovered',
+  reason?: string
+): Promise<void> {
+  if (!cfg.decisionLogPath) return;
+  try {
+    recordDecision($, cfg, buildHealthRecord(cfg, event, reason, await getSessionId($)));
+  } catch {
+    // Health logging never affects a decision
+  }
+}
+
+/**
+ * Whether this failure may open the breaker. While the breaker is open the
+ * engine is skipped, which under fail-open means injection isn't scanned. So
+ * in fail-open LOCAL mode only a failure to start the engine counts, or
+ * input that crashes the engine three times would open a 30 s gap for
+ * everything after it.
+ */
+function countsTowardBreaker(cfg: RuntimeConfig, err: unknown): boolean {
+  if (cfg.failOpen && cfg.mode !== 'WATERFALL') {
+    return err instanceof EngineSpawnError;
+  }
+  return true;
+}
+
+async function noteEngineFailure(
+  $: EngineInterface,
+  cfg: RuntimeConfig,
+  reason: string,
+  err: unknown
+): Promise<void> {
+  if (countsTowardBreaker(cfg, err)) {
+    consecutiveEngineFailures += 1;
+  }
+  lastEngineFailure = reason;
+  if (consecutiveEngineFailures >= BREAKER_THRESHOLD) {
+    breakerOpenUntilMs = Date.now() + BREAKER_COOLDOWN_MS;
+  }
+  if (engineHealthy) {
+    engineHealthy = false;
+    const injection =
+      cfg.mode === 'WATERFALL'
+        ? 'injection scanning continues in Model Armor'
+        : cfg.failOpen
+          ? 'injection scanning is skipped (ARMORCEPT_FAIL_OPEN=true)'
+          : 'other actions are blocked until it recovers';
+    safeUi(() =>
+      $.ui.toast(
+        `⚠️ ArmorCept engine unavailable (${reason}). Secret checks continue in-process; ${injection}.`,
+        { timeoutMs: 8000 }
+      )
+    );
+    safeUi(() => $.ui.status(getStatusBadge(cfg.mode, 'ts-fallback')));
+    await logHealth($, cfg, 'engine_unavailable', reason);
+  }
+}
+
+async function noteEngineSuccess($: EngineInterface, cfg: RuntimeConfig): Promise<void> {
+  consecutiveEngineFailures = 0;
+  breakerOpenUntilMs = 0;
+  if (!engineHealthy) {
+    engineHealthy = true;
+    lastEngineFailure = '';
+    safeUi(() => $.ui.toast('🛡️ ArmorCept engine recovered', { timeoutMs: 4000 }));
+    await logHealth($, cfg, 'engine_recovered');
+  }
+}
+
+async function runGuardedLocalPass(
+  $: EngineInterface,
+  text: string,
+  cfg: RuntimeConfig
+): Promise<PromptArmorResult> {
+  if (Date.now() < breakerOpenUntilMs) {
+    throw new EngineUnavailableError(
+      `${lastEngineFailure || 'repeated failures'}; ${consecutiveEngineFailures} failures in a row, retrying in ${Math.ceil(
+        (breakerOpenUntilMs - Date.now()) / 1000
+      )}s`
+    );
+  }
+  try {
+    const local = await runLocalPass($, text, cfg);
+    await noteEngineSuccess($, cfg);
+    return local;
+  } catch (err) {
+    await noteEngineFailure($, cfg, shortReason(err), err);
+    throw err;
+  }
+}
+
+/**
+ * The Python engine couldn't produce a result. Secrets are still checked with
+ * the in-process patterns; injection goes to Model Armor in WATERFALL mode,
+ * and otherwise follows ARMORCEPT_FAIL_OPEN.
+ */
+async function engineUnavailableVerdict(
+  $: EngineInterface,
+  text: string,
+  cfg: RuntimeConfig,
+  err: unknown
+): Promise<EvaluationVerdict> {
+  const reason = shortReason(err);
+  const unavailable = `ArmorCept engine unavailable (${reason})`;
+
+  const dlp: PromptArmorResult = { ...scanFallbackDlp(text), engine_mode: 'ts-fallback' };
+  let dlpVerdict: EvaluationVerdict | undefined;
+  if (dlp.findings.length > 0) {
+    dlpVerdict = {
+      ...evaluateLocalVerdict(dlp, cfg),
+      mode: cfg.mode,
+      source: 'ArmorCept DLP',
+      engineMode: 'ts-fallback',
+      warning: unavailable,
+    };
+    if (dlpVerdict.decision === 'BLOCK') {
+      return dlpVerdict;
+    }
+  }
+
+  if (cfg.mode === 'WATERFALL') {
+    const cloud = await runCloudPass($, text, cfg, true);
+    if (dlpVerdict && cloud.decision !== 'BLOCK') {
+      // Keep the in-process DLP warning; the cloud found nothing stronger
+      return {
+        ...dlpVerdict,
+        findings: [...dlpVerdict.findings, ...cloud.findings],
+        spans: [...(dlpVerdict.spans ?? []), ...(cloud.spans ?? [])],
+      };
+    }
+    return { ...cloud, engineMode: 'ts-fallback', warning: unavailable };
+  }
+
+  if (cfg.failOpen) {
+    if (dlpVerdict) {
+      return { ...dlpVerdict, reason: `${dlpVerdict.reason}; ${unavailable}` };
+    }
+    return {
+      decision: 'ALLOW',
+      source: 'ArmorCept',
+      mode: cfg.mode,
+      reason: `${unavailable}; injection scanning skipped (ARMORCEPT_FAIL_OPEN=true)`,
+      findings: [],
+      engineMode: 'ts-fallback',
+      warning: unavailable,
+    };
+  }
+
+  const message = err instanceof Error ? err.message : String(err);
+  return {
+    decision: 'BLOCK',
+    source: 'ArmorCept',
+    mode: cfg.mode,
+    reason: unavailable,
+    findings: [`EngineError: ${shortReason(message)}`],
+    engineMode: 'ts-fallback',
+    warning: unavailable,
+  };
+}
+
+export function chunkWithOffsets(
+  text: string,
+  chunkSize = MAX_LOCAL_SCAN_CHUNK_CHARS
+): { chunk: string; offset: number }[] {
+  if (text.length <= chunkSize) {
+    return [{ chunk: text, offset: 0 }];
+  }
+  const chunks: { chunk: string; offset: number }[] = [];
+  const step = Math.max(1024, chunkSize - CHUNK_OVERLAP_CHARS);
+  for (let offset = 0; offset < text.length; offset += step) {
+    chunks.push({ chunk: text.slice(offset, offset + chunkSize), offset });
+    if (offset + chunkSize >= text.length) break;
+  }
+  return chunks;
+}
+
 export function splitIntoChunks(
   text: string,
   chunkSize = MAX_LOCAL_SCAN_CHUNK_CHARS
 ): string[] {
-  if (text.length <= chunkSize) {
-    return [text];
-  }
-  const chunks: string[] = [];
-  const step = Math.max(1024, chunkSize - CHUNK_OVERLAP_CHARS);
-  for (let offset = 0; offset < text.length; offset += step) {
-    chunks.push(text.slice(offset, offset + chunkSize));
-    if (offset + chunkSize >= text.length) break;
-  }
-  return chunks;
+  return chunkWithOffsets(text, chunkSize).map((c) => c.chunk);
+}
+
+/** Builds a BLOCK verdict for exact secret matches without ever including the value. */
+export function exactSecretVerdict(
+  matches: readonly SecretMatch[],
+  mode: ArmorCeptMode
+): EvaluationVerdict {
+  const categories = Array.from(new Set(matches.map((m) => m.category)));
+  const first = matches[0];
+  const where = first
+    ? ` (${first.encoding} at offset ${first.start}${matches.length > 1 ? `, ${matches.length} matches` : ''})`
+    : '';
+  const spans: MatchSpan[] = matches.map((m) => ({
+    category: m.category,
+    start: m.start,
+    end: m.end,
+  }));
+  return {
+    decision: 'BLOCK',
+    source: 'ArmorCept Secrets',
+    mode,
+    reason: `Exact value of $${first?.name ?? 'secret'} found${where}`,
+    findings: categories,
+    score: 1,
+    confidence: 1,
+    spans,
+  };
 }
 
 export async function evaluateArmorCept(
@@ -307,6 +570,13 @@ export async function evaluateArmorCept(
     effectiveFailOpen = cfg.failOpen;
 
     safeUi(() => $.ui.status('🛡️ ArmorCept: Scanning...'));
+
+    // Exact secret values are checked locally first, so they are caught even
+    // in CLOUD mode and never sent to an engine.
+    const exact = findExactSecrets(text);
+    if (exact.length > 0) {
+      return exactSecretVerdict(exact, cfg.mode);
+    }
 
     if (text.length > MAX_TOTAL_SCAN_CHARS) {
       throw new Error(

@@ -10,6 +10,7 @@ import type {
 } from 'claude-code';
 import type {
   EvaluationVerdict,
+  MatchSpan,
   PromptArmorDecision,
   PromptArmorResult,
   RuntimeConfig,
@@ -127,6 +128,23 @@ export function parsePromptArmorJson(parsed: unknown): PromptArmorResult {
     ? obj['dlp_categories']
     : [];
 
+  const dlpSpans: MatchSpan[] = [];
+  if (Array.isArray(obj['dlp_spans'])) {
+    for (const item of obj['dlp_spans'] as unknown[]) {
+      if (!Array.isArray(item) || item.length !== 3) continue;
+      const [category, start, end] = item as unknown[];
+      if (
+        typeof category === 'string' &&
+        Number.isInteger(start) &&
+        Number.isInteger(end) &&
+        (start as number) >= 0 &&
+        (end as number) > (start as number)
+      ) {
+        dlpSpans.push({ category, start: start as number, end: end as number });
+      }
+    }
+  }
+
   const engineModeRaw = obj['engine_mode'];
   const engine_mode =
     engineModeRaw === 'full' || engineModeRaw === 'lightweight_fallback'
@@ -141,6 +159,7 @@ export function parsePromptArmorJson(parsed: unknown): PromptArmorResult {
       String(item).replace(/^Category\./i, '')
     ),
     dlpCategories: rawDlpList.map((item) => String(item)),
+    dlpSpans,
     latency_ms:
       typeof obj['latency_ms'] === 'number' ? obj['latency_ms'] : undefined,
     engine_mode,
@@ -185,7 +204,16 @@ export async function resolvePythonBinary(
  * a slow start never blocks a hook for long and never causes the
  * still-starting process to be killed and respawned.
  */
-export function startWarmDaemon($: EngineInterface): Promise<string | undefined> {
+function engineExtraArgs(cfg: RuntimeConfig | undefined): string[] {
+  return cfg?.extraPatternsPath
+    ? ['--extra-patterns', cfg.extraPatternsPath]
+    : [];
+}
+
+export function startWarmDaemon(
+  $: EngineInterface,
+  cfg?: RuntimeConfig
+): Promise<string | undefined> {
   if (warmDaemonUrl) {
     return Promise.resolve(warmDaemonUrl);
   }
@@ -227,6 +255,7 @@ export function startWarmDaemon($: EngineInterface): Promise<string | undefined>
           '127.0.0.1',
           '--port',
           '0',
+          ...engineExtraArgs(cfg),
         ],
         env: {
           ARMORCEPT_DAEMON_TOKEN: token,
@@ -374,6 +403,14 @@ async function callHttpDaemon(
   return parsePromptArmorJson(parsed);
 }
 
+/**
+ * The engine couldn't be started at all: the interpreter or engine file is
+ * missing or not executable (exit 126/127, or the spawn itself failed).
+ * Decided from the exit code and the runtime's own error, never from stderr,
+ * which a payload can influence.
+ */
+export class EngineSpawnError extends Error {}
+
 async function callStdioOneShot(
   $: EngineInterface,
   text: string,
@@ -381,11 +418,28 @@ async function callStdioOneShot(
 ): Promise<PromptArmorResult> {
   const { binary: pythonBin } = await resolvePythonBinary($);
   const daemonPath = `${$.plugin.root}/python/daemon.py`;
-  const proc = await $.process.run([pythonBin, daemonPath, '--mode', 'stdio'], {
-    stdin: JSON.stringify({ text }) + '\n',
-    timeoutMs: cfg.promptArmorTimeoutMs,
-  });
+  let proc;
+  try {
+    proc = await $.process.run(
+      [pythonBin, daemonPath, '--mode', 'stdio', ...engineExtraArgs(cfg)],
+      {
+        stdin: JSON.stringify({ text }) + '\n',
+        timeoutMs: cfg.promptArmorTimeoutMs,
+      }
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/\b(ENOENT|EACCES|ENOEXEC)\b/.test(message)) {
+      throw new EngineSpawnError(`prompt-armor daemon could not start: ${message}`);
+    }
+    throw err;
+  }
 
+  if (proc.exitCode === 126 || proc.exitCode === 127) {
+    throw new EngineSpawnError(
+      `prompt-armor daemon exited ${proc.exitCode}: ${proc.stderr || proc.stdout}`
+    );
+  }
   if (proc.exitCode !== 0) {
     throw new Error(
       `prompt-armor daemon exited ${proc.exitCode}: ${proc.stderr || proc.stdout}`
@@ -423,7 +477,7 @@ export async function runPromptArmor(
         ? 0
         : Math.min(30_000, 1000 * 2 ** (daemonFailureCount - 1));
     if (Date.now() - lastDaemonSpawnAttemptMs >= backoffMs) {
-      void startWarmDaemon($);
+      void startWarmDaemon($, cfg);
     }
   }
 
