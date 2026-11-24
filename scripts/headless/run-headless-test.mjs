@@ -121,6 +121,39 @@ const scenarios = [
     ],
   },
   {
+    name: 'recommended runner config in user settings survives a repo turning secret enforcement off',
+    env: { RUNNER_SECRET },
+    // User settings, not --settings: a project's settings outrank the user's
+    // but not --settings, so this is the layering the guard has to handle
+    userSettings: {
+      env: {
+        ARMORCEPT_ENFORCEMENT: 'audit',
+        ARMORCEPT_AUDIT_ENFORCE_SECRETS: 'true',
+        ARMORCEPT_SECRET_ENV_VARS: 'RUNNER_SECRET',
+        ARMORCEPT_SCAN_TOOL_RESULTS: 'true',
+        ARMORCEPT_TOOL_RESULT_ACTION: 'redact',
+      },
+    },
+    setup: (work) => {
+      mkdirSync(join(work, '.claude'), { recursive: true });
+      writeFileSync(
+        join(work, '.claude', 'settings.json'),
+        JSON.stringify({
+          env: {
+            ARMORCEPT_AUDIT_ENFORCE_SECRETS: 'false',
+            ARMORCEPT_SECRET_ENV_VARS: 'SOME_UNSET_NAME',
+            ARMORCEPT_SCAN_TOOL_RESULTS: 'false',
+          },
+        })
+      );
+    },
+    steps: ['printenv RUNNER_SECRET'],
+    check: ({ record }) => [
+      ['value redacted', record.toolResults[0]?.text.includes('[REDACTED:SECRET_EXACT_RUNNER_SECRET]')],
+      ['value never reached the model', !JSON.stringify(record).includes(RUNNER_SECRET)],
+    ],
+  },
+  {
     name: 'audit mode records but does not block',
     env: { ARMORCEPT_ENFORCEMENT: 'audit' },
     steps: [`echo ${FAKE_AWS_KEY} > audited.txt`],
@@ -157,7 +190,7 @@ function startStub() {
   });
 }
 
-function runClaude(work, configDir, base, extraEnv) {
+function runClaude(work, configDir, base, extraEnv, settings) {
   return new Promise((resolveRun) => {
     const started = Date.now();
     const env = {
@@ -186,6 +219,7 @@ function runClaude(work, configDir, base, extraEnv) {
         'Bash',
         '--max-turns',
         '6',
+        ...(settings ? ['--settings', JSON.stringify(settings)] : []),
       ],
       { cwd: work, env, stdio: ['ignore', 'pipe', 'pipe'] }
     );
@@ -210,11 +244,14 @@ try {
     const configDir = mkdtempSync(join(tmpdir(), 'armorcept-claude-config-'));
     try {
       scenario.setup?.(work);
+      if (scenario.userSettings) {
+        writeFileSync(join(configDir, 'settings.json'), JSON.stringify(scenario.userSettings));
+      }
       await fetch(`${base}/__script`, {
         method: 'POST',
         body: JSON.stringify({ steps: scenario.steps }),
       });
-      const run = await runClaude(work, configDir, base, scenario.env);
+      const run = await runClaude(work, configDir, base, scenario.env, scenario.settings);
       // Give the decision log's background writer a moment after exit
       await new Promise((r) => setTimeout(r, 300));
       const record = await (await fetch(`${base}/__record`)).json();

@@ -105,14 +105,22 @@ Configure ArmorCept in `.claude/settings.json` (or enterprise managed policy set
 
 ### Settings a repository can't weaken
 
-Claude Code applies the `env` block of a checked-out repository's own `.claude/settings.json` and `.claude/settings.local.json`. A repository you don't trust could use that to switch ArmorCept off. So ArmorCept ignores these variables when only the repository's settings set them:
+Claude Code applies the `env` block of a checked-out repository's own `.claude/settings.json` and `.claude/settings.local.json`, and those outrank your user settings. A repository you don't trust could use that to switch ArmorCept off. So every variable in the reference below is ignored when only the repository's settings set it, unless the value only adds protection:
 
-- `ARMORCEPT_ENFORCEMENT=audit`, `ARMORCEPT_FAIL_OPEN=true` and `ARMORCEPT_INTERACTIVE_OVERRIDE=true`
-- a non-empty `ARMORCEPT_EXEMPT_TOOLS` or `ARMORCEPT_ALLOWLIST_PATHS`
-- `ARMORCEPT_LOCAL_DLP_ACTION` set to anything but `block`
-- any value of `ARMORCEPT_MODE`, `ARMORCEPT_EXTRA_PATTERNS`, `ARMORCEPT_DECISION_LOG`, `PROMPT_ARMOR_ENDPOINT`, the `WATERFALL_*` thresholds, `MODEL_ARMOR_TEMPLATE_ID`, `GOOGLE_CLOUD_ACCESS_TOKEN` and `GOOGLE_APPLICATION_CREDENTIALS`
+| Variable | Values a repository may set |
+| :--- | :--- |
+| `ARMORCEPT_ENFORCEMENT` | `enforce` |
+| `ARMORCEPT_FAIL_OPEN`, `ARMORCEPT_INTERACTIVE_OVERRIDE`, `ARMORCEPT_ALLOW_GCLOUD_ADC` | `false` |
+| `ARMORCEPT_AUDIT_ENFORCE_SECRETS`, `ARMORCEPT_SCAN_TOOL_RESULTS`, `WATERFALL_ALWAYS_RUN_CLOUD_DLP` | `true` |
+| `ARMORCEPT_LOCAL_DLP_ACTION` | `block` |
+| `ARMORCEPT_TOOL_RESULT_ACTION` | `withhold` |
+| `ARMORCEPT_EXEMPT_TOOLS`, `ARMORCEPT_ALLOWLIST_PATHS` | empty |
+| `ARMORCEPT_SECRET_ENV_VARS` | a list that keeps every name your own settings list |
+| everything else (mode, endpoint, timeouts, thresholds, custom patterns, log path and size, Model Armor and Google Cloud settings, `HOME`) | nothing |
 
-The value is kept when managed policy, your user settings (`~/.claude/settings.json`) or `--settings` give the same value. A toast at session start names each variable that was ignored. Settings that only add protection, such as `ARMORCEPT_SCAN_TOOL_RESULTS=true` or `ARMORCEPT_SECRET_ENV_VARS`, still apply from a repository.
+A value is kept when managed policy, your user settings (`~/.claude/settings.json`) or `--settings` give the same value. A toast at session start names each variable that was ignored. If this Claude Code can't read the repository's settings layers, ArmorCept treats any value your own settings don't confirm as the repository's.
+
+`--settings` and managed policy outrank a repository's settings, so they are the safest place for a runner's configuration. A `~/` path that can't be expanded is a configuration error, so it never resolves to a `~` folder inside the repository.
 
 If you keep ArmorCept's settings in your own projects' `.claude/settings.json`, set `ARMORCEPT_TRUST_PROJECT_SETTINGS=true` in your user settings, managed policy or `--settings`. This variable is never read from a repository's settings.
 
@@ -165,7 +173,7 @@ ArmorCept works in headless Claude Code (`claude -p`, `--output-format stream-js
 - `$.ui.ask` overrides never happen. A block stays a block, and the model receives the deny message.
 - Toasts and the status bar go nowhere, so use the decision log to see what happened.
 
-Recommended `env` for an unattended runner. Put it in the runner's user settings or pass it with `--settings`, not in the checked-out repository, whose settings can't set most of these (see [Settings a repository can't weaken](#settings-a-repository-cant-weaken)):
+Recommended `env` for an unattended runner. Pass it with `--settings` or managed policy, which outrank the checked-out repository's settings, or put it in the runner's user settings. Don't put it in the repository: its settings can't set most of these (see [Settings a repository can't weaken](#settings-a-repository-cant-weaken)):
 
 ```json
 {
@@ -185,7 +193,7 @@ Start in `audit` mode with secrets enforced, review the log (see [Measuring fals
 
 **Expected latency.** With the warm worker, a scan adds single-digit milliseconds with the built-in engine (in CI, p50 around 4 ms and p95 around 30 ms) and typically under 30 ms with `prompt-armor`. The worker starts at `session.start`. Until it's ready (at most 3.5 s), calls use one-shot `stdio` scans, which take about 1.5–4 s each with `prompt-armor` installed. Result scanning (`ARMORCEPT_SCAN_TOOL_RESULTS`) adds a second scan per tool call.
 
-`npm run test:headless` runs real `claude -p` sessions with the plugin loaded against a local stub model (`scripts/headless/`). It checks that the worker starts, that a secret in a tool call is blocked, that a repository's `.claude/settings.json` can't switch audit mode on, that one in a tool result is redacted or withheld, that exact env-var values and audit mode work, and that a clean session runs through. It needs no API key and makes no network calls; CI runs it on the pinned Claude Code version.
+`npm run test:headless` runs real `claude -p` sessions with the plugin loaded against a local stub model (`scripts/headless/`). It checks that the worker starts, that a secret in a tool call is blocked, that a repository's `.claude/settings.json` can't switch audit mode on or turn secret enforcement off, that one in a tool result is redacted or withheld, that exact env-var values and audit mode work, and that a clean session runs through. It needs no API key and makes no network calls; CI runs it on the pinned Claude Code version.
 
 ## Redacting Tool Results
 

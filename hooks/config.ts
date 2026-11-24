@@ -82,7 +82,9 @@ export function resolveUserPath(
   sessionCwd: string | undefined
 ): string | undefined {
   if (!value) return undefined;
-  if (value.startsWith('~/') && home) {
+  if (value.startsWith('~/')) {
+    // Never fall through to a cwd-relative "~" directory inside the repository
+    if (!home) throw new Error(`Cannot expand "${value}": HOME is not set`);
     return `${home.replace(/\/+$/, '')}/${value.slice(2)}`;
   }
   if (!value.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(value) && sessionCwd) {
@@ -91,36 +93,40 @@ export function resolveUserPath(
   return value;
 }
 
-export interface RawConfigEnv {
-  ARMORCEPT_MODE?: string;
-  ARMORCEPT_FAIL_OPEN?: string;
-  PROMPT_ARMOR_ENDPOINT?: string;
-  PROMPT_ARMOR_TIMEOUT_MS?: string;
-  WATERFALL_ALLOW_BELOW?: string;
-  WATERFALL_BLOCK_ABOVE?: string;
-  WATERFALL_MIN_CONFIDENCE?: string;
-  WATERFALL_ALWAYS_RUN_CLOUD_DLP?: string;
-  ARMORCEPT_LOCAL_DLP_ACTION?: string;
-  ARMORCEPT_ALLOW_GCLOUD_ADC?: string;
-  ARMORCEPT_SCAN_TOOL_RESULTS?: string;
-  ARMORCEPT_INTERACTIVE_OVERRIDE?: string;
-  ARMORCEPT_EXEMPT_TOOLS?: string;
-  ARMORCEPT_ALLOWLIST_PATHS?: string;
-  ARMORCEPT_EXTRA_PATTERNS?: string;
-  ARMORCEPT_SECRET_ENV_VARS?: string;
-  ARMORCEPT_ENFORCEMENT?: string;
-  ARMORCEPT_TOOL_RESULT_ACTION?: string;
-  ARMORCEPT_AUDIT_ENFORCE_SECRETS?: string;
-  ARMORCEPT_DECISION_LOG?: string;
-  ARMORCEPT_DECISION_LOG_MAX_BYTES?: string;
-  GOOGLE_APPLICATION_CREDENTIALS?: string;
-  GOOGLE_CLOUD_ACCESS_TOKEN?: string;
-  GOOGLE_CLOUD_PROJECT?: string;
-  GOOGLE_CLOUD_LOCATION?: string;
-  MODEL_ARMOR_TEMPLATE_ID?: string;
-  MODEL_ARMOR_TIMEOUT_MS?: string;
-  HOME?: string;
-}
+/** Every environment variable the configuration reads. */
+export const CONFIG_ENV_NAMES = [
+  'ARMORCEPT_MODE',
+  'ARMORCEPT_FAIL_OPEN',
+  'PROMPT_ARMOR_ENDPOINT',
+  'PROMPT_ARMOR_TIMEOUT_MS',
+  'WATERFALL_ALLOW_BELOW',
+  'WATERFALL_BLOCK_ABOVE',
+  'WATERFALL_MIN_CONFIDENCE',
+  'WATERFALL_ALWAYS_RUN_CLOUD_DLP',
+  'ARMORCEPT_LOCAL_DLP_ACTION',
+  'ARMORCEPT_ALLOW_GCLOUD_ADC',
+  'ARMORCEPT_SCAN_TOOL_RESULTS',
+  'ARMORCEPT_INTERACTIVE_OVERRIDE',
+  'ARMORCEPT_EXEMPT_TOOLS',
+  'ARMORCEPT_ALLOWLIST_PATHS',
+  'ARMORCEPT_EXTRA_PATTERNS',
+  'ARMORCEPT_SECRET_ENV_VARS',
+  'ARMORCEPT_ENFORCEMENT',
+  'ARMORCEPT_TOOL_RESULT_ACTION',
+  'ARMORCEPT_AUDIT_ENFORCE_SECRETS',
+  'ARMORCEPT_DECISION_LOG',
+  'ARMORCEPT_DECISION_LOG_MAX_BYTES',
+  'GOOGLE_APPLICATION_CREDENTIALS',
+  'GOOGLE_CLOUD_ACCESS_TOKEN',
+  'GOOGLE_CLOUD_PROJECT',
+  'GOOGLE_CLOUD_LOCATION',
+  'MODEL_ARMOR_TEMPLATE_ID',
+  'MODEL_ARMOR_TIMEOUT_MS',
+  'HOME',
+] as const;
+
+export type ConfigEnvName = (typeof CONFIG_ENV_NAMES)[number];
+export type RawConfigEnv = Partial<Record<ConfigEnvName, string>>;
 
 export function buildRuntimeConfig(
   raw: RawConfigEnv,
@@ -328,45 +334,46 @@ export function buildRuntimeConfig(
 
 type SettingsLayerSource = 'user' | 'project' | 'local' | 'flag' | 'policy';
 
-const truthy = (v: string): boolean =>
-  ['true', '1', 'yes'].includes((stripQuotes(v) ?? '').trim().toLowerCase());
-const nonEmpty = (v: string): boolean => (stripQuotes(v) ?? '').trim() !== '';
-const always = (): boolean => true;
+const norm = (v: string): string => (stripQuotes(v) ?? '').trim().toLowerCase();
+const truthy = (v: string): boolean => ['true', '1', 'yes'].includes(norm(v));
 
 /**
- * Variables that a checked-out repository's own `.claude/settings.json` or
- * `.claude/settings.local.json` must not set, because the value switches
- * protection off, routes scans to another endpoint or project, or picks the
- * code that decides. Each predicate says which values count as weakening.
+ * Values a repository's own settings may set, by variable: each rule says
+ * whether a value only adds protection. A variable with no rule here is
+ * never taken from a repository, so a new variable is guarded until someone
+ * decides otherwise. `trusted` is the value from policy, --settings or user
+ * settings, if any.
  */
-export const REPO_GUARDED_SETTINGS: Readonly<Record<string, (value: string) => boolean>> = {
-  ARMORCEPT_ENFORCEMENT: (v) => (stripQuotes(v) ?? '').trim().toLowerCase() === 'audit',
-  ARMORCEPT_FAIL_OPEN: truthy,
-  ARMORCEPT_INTERACTIVE_OVERRIDE: truthy,
-  ARMORCEPT_EXEMPT_TOOLS: nonEmpty,
-  ARMORCEPT_ALLOWLIST_PATHS: nonEmpty,
-  ARMORCEPT_LOCAL_DLP_ACTION: (v) => (stripQuotes(v) ?? '').trim().toLowerCase() !== 'block',
-  ARMORCEPT_TOOL_RESULT_ACTION: (v) => (stripQuotes(v) ?? '').trim().toLowerCase() !== 'withhold',
-  ARMORCEPT_MODE: always,
-  ARMORCEPT_EXTRA_PATTERNS: always,
-  ARMORCEPT_DECISION_LOG: always,
-  PROMPT_ARMOR_ENDPOINT: always,
-  WATERFALL_ALLOW_BELOW: always,
-  WATERFALL_BLOCK_ABOVE: always,
-  WATERFALL_MIN_CONFIDENCE: always,
-  MODEL_ARMOR_TEMPLATE_ID: always,
-  GOOGLE_CLOUD_ACCESS_TOKEN: always,
-  GOOGLE_APPLICATION_CREDENTIALS: always,
+export const REPO_ALLOWED_VALUES: Readonly<
+  Partial<Record<ConfigEnvName, (value: string, trusted: string | undefined) => boolean>>
+> = {
+  ARMORCEPT_ENFORCEMENT: (v) => norm(v) === 'enforce',
+  ARMORCEPT_FAIL_OPEN: (v) => !truthy(v),
+  ARMORCEPT_INTERACTIVE_OVERRIDE: (v) => !truthy(v),
+  ARMORCEPT_ALLOW_GCLOUD_ADC: (v) => !truthy(v),
+  ARMORCEPT_AUDIT_ENFORCE_SECRETS: (v) => truthy(v),
+  ARMORCEPT_SCAN_TOOL_RESULTS: (v) => truthy(v),
+  WATERFALL_ALWAYS_RUN_CLOUD_DLP: (v) => truthy(v),
+  ARMORCEPT_LOCAL_DLP_ACTION: (v) => norm(v) === 'block',
+  ARMORCEPT_TOOL_RESULT_ACTION: (v) => norm(v) === 'withhold',
+  ARMORCEPT_EXEMPT_TOOLS: (v) => parseCsvList(v).length === 0,
+  ARMORCEPT_ALLOWLIST_PATHS: (v) => parseCsvList(v).length === 0,
+  // A repository may add names to match, never drop the trusted ones
+  ARMORCEPT_SECRET_ENV_VARS: (v, trusted) => {
+    const names = new Set(parseCsvList(v));
+    return parseCsvList(trusted).every((n) => names.has(n));
+  },
 };
 
 async function readLayerEnv(
   $: EngineInterface,
   source: SettingsLayerSource
-): Promise<Record<string, string>> {
+): Promise<Record<string, string> | undefined> {
   try {
     const layer: unknown = await $.settings.read({ source });
-    if (!layer || typeof layer !== 'object' || !('env' in layer)) return {};
-    const env = (layer as { env?: unknown }).env;
+    if (!layer || typeof layer !== 'object') return undefined;
+    const env = 'env' in layer ? (layer as { env?: unknown }).env : undefined;
+    if (env === undefined) return {};
     if (!env || typeof env !== 'object') return {};
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(env as Record<string, unknown>)) {
@@ -374,14 +381,19 @@ async function readLayerEnv(
     }
     return out;
   } catch {
-    return {};
+    return undefined;
   }
 }
 
 /**
- * Drops guarded values that only a repository's settings supply. A value
+ * Drops configuration values that only a repository's settings supply,
+ * unless REPO_ALLOWED_VALUES says the value only adds protection. A value
  * stays when managed policy, user settings or `--settings` give the same
  * value, or when one of those sets ARMORCEPT_TRUST_PROJECT_SETTINGS=true.
+ *
+ * If the project or local layer can't be read, any value not confirmed by a
+ * trusted layer is treated as the repository's.
+ *
  * Returns the names dropped; `raw` is changed in place.
  */
 export async function dropRepoWeakenedSettings(
@@ -389,7 +401,7 @@ export async function dropRepoWeakenedSettings(
   raw: RawConfigEnv,
   policyEnv: Record<string, string>
 ): Promise<string[]> {
-  const [user, project, local, flag] = await Promise.all([
+  const [user = {}, project, local, flag = {}] = await Promise.all([
     readLayerEnv($, 'user'),
     readLayerEnv($, 'project'),
     readLayerEnv($, 'local'),
@@ -400,18 +412,22 @@ export async function dropRepoWeakenedSettings(
     flag['ARMORCEPT_TRUST_PROJECT_SETTINGS'] ??
     user['ARMORCEPT_TRUST_PROJECT_SETTINGS'];
   if (trustFlag !== undefined && truthy(trustFlag)) return [];
+  const repoUnreadable = project === undefined || local === undefined;
 
   const dropped: string[] = [];
-  const rec = raw as Record<string, string | undefined>;
-  for (const [name, weakens] of Object.entries(REPO_GUARDED_SETTINGS)) {
+  for (const name of CONFIG_ENV_NAMES) {
     if (name in policyEnv) continue;
-    const repoValue = local[name] ?? project[name];
-    if (repoValue === undefined) continue;
-    const effective = rec[name];
-    if (effective === undefined || effective !== repoValue) continue;
-    if (flag[name] === repoValue || user[name] === repoValue) continue;
-    if (!weakens(repoValue)) continue;
-    rec[name] = flag[name] ?? user[name];
+    const effective = raw[name];
+    if (effective === undefined) continue;
+    const repoValue = local?.[name] ?? project?.[name];
+    if (repoValue === undefined && !repoUnreadable) continue;
+    if (repoValue !== undefined && effective !== repoValue) continue;
+    const trusted = flag[name] ?? user[name];
+    if (trusted === effective) continue;
+    if (repoValue === undefined && name === 'HOME') continue; // the shell's own HOME
+    const allowed = REPO_ALLOWED_VALUES[name];
+    if (allowed && allowed(effective, trusted)) continue;
+    raw[name] = trusted;
     dropped.push(name);
   }
   return dropped;

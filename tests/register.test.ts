@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from 'claude-code/testing';
-import { buildRuntimeConfig } from '../hooks/config';
+import { buildRuntimeConfig, CONFIG_ENV_NAMES, REPO_ALLOWED_VALUES } from '../hooks/config';
 import {
   clearExactSecrets,
   findExactSecrets,
@@ -23,7 +23,7 @@ function registerBaseMocks(
   on: Parameters<typeof mock.env>[0],
   envVars: Record<string, string>,
   toolOutputs: Record<string, string> = {},
-  settingsLayers: Partial<Record<string, { env?: Record<string, string> }>> = {}
+  settingsLayers: Partial<Record<string, { env?: Record<string, string> } | null>> = {}
 ): {
   toasts: string[];
   statuses: (string | undefined)[];
@@ -38,7 +38,12 @@ function registerBaseMocks(
   mock.env(on, envVars);
   on('settings.read', ($, e) => {
     const source = (e as unknown as { source?: string }).source;
-    return { value: (source ? settingsLayers[source] : undefined) ?? {} };
+    // null stands for a layer this Claude Code can't read
+    if (source && source in settingsLayers) {
+      const layer = settingsLayers[source];
+      return layer === null ? { deny: 'source not available' } : { value: layer ?? {} };
+    }
+    return { value: {} };
   });
   on('session.cwd', () => ({ value: '/workspace' }));
   on('fs.exists', () => ({ value: true }));
@@ -1797,7 +1802,9 @@ describe('ArmorCept — Settings a repository may not weaken', () => {
     missingEngine(on);
     on('session.start', ($, e) => e);
     await $.session.start({ cwd: '/workspace', surface: null, isInteractive: false } as never);
-    expect(toasts.some((t) => t.includes('ignoring ARMORCEPT_ENFORCEMENT, ARMORCEPT_FAIL_OPEN'))).toBe(true);
+    const ignored = toasts.find((t) => t.includes('ignoring')) ?? '';
+    expect(ignored).toContain('ARMORCEPT_ENFORCEMENT');
+    expect(ignored).toContain('ARMORCEPT_FAIL_OPEN');
     const secret = await $.tool.call({ tool: 'Bash', command: `echo ${KEY}` });
     expect(secret.deny).toContain('SECRET_LEAK_AWS_ACCESS_KEY');
     // Fail-open was dropped too, so a clean call is blocked while the engine is down
@@ -1845,6 +1852,126 @@ describe('ArmorCept — Settings a repository may not weaken', () => {
     missingEngine(on);
     const secret = await $.tool.call({ tool: 'Bash', command: `echo ${KEY}` });
     expect(secret.deny).toContain('SECRET_LEAK_AWS_ACCESS_KEY');
+  });
+
+  test('every config variable is guarded: a weakening value from the repo alone is dropped', async ($, on) => {
+    // A weakening value for each variable that has an allow rule; any value for the rest
+    const weak: Partial<Record<string, string>> = {
+      ARMORCEPT_ENFORCEMENT: 'audit',
+      ARMORCEPT_FAIL_OPEN: 'true',
+      ARMORCEPT_INTERACTIVE_OVERRIDE: 'true',
+      ARMORCEPT_ALLOW_GCLOUD_ADC: 'true',
+      ARMORCEPT_AUDIT_ENFORCE_SECRETS: 'false',
+      ARMORCEPT_SCAN_TOOL_RESULTS: 'false',
+      WATERFALL_ALWAYS_RUN_CLOUD_DLP: 'false',
+      ARMORCEPT_LOCAL_DLP_ACTION: 'warn',
+      ARMORCEPT_TOOL_RESULT_ACTION: 'redact',
+      ARMORCEPT_EXEMPT_TOOLS: 'Bash',
+      ARMORCEPT_ALLOWLIST_PATHS: '**',
+      ARMORCEPT_SECRET_ENV_VARS: 'SOME_UNSET_NAME',
+    };
+    const repoEnv: Record<string, string> = {};
+    for (const name of CONFIG_ENV_NAMES) repoEnv[name] = weak[name] ?? `/repo/${name.toLowerCase()}`;
+    repoEnv['ARMORCEPT_MODE'] = 'CLOUD';
+    const { toasts } = registerBaseMocks(on, repoEnv, {}, {
+      project: { env: repoEnv },
+      user: { env: { ARMORCEPT_SECRET_ENV_VARS: 'GH_TOKEN' } },
+    });
+    on('process.run', () => ({
+      value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    }));
+    on('session.start', ($, e) => e);
+    await $.session.start({ cwd: '/workspace', surface: null, isInteractive: false } as never);
+    const ignored = toasts.find((t) => t.includes('ignoring')) ?? '';
+    // Read end to end, so a variable the config reads but the guard skips fails here
+    for (const name of CONFIG_ENV_NAMES) {
+      if (!ignored.includes(`${name},`) && !ignored.includes(`${name} from`)) {
+        throw new Error(`${name} from the repository was not dropped`);
+      }
+    }
+    // Changing which values a repository may set needs a deliberate test change
+    expect(Object.keys(REPO_ALLOWED_VALUES).sort()).toEqual([
+      'ARMORCEPT_ALLOWLIST_PATHS',
+      'ARMORCEPT_ALLOW_GCLOUD_ADC',
+      'ARMORCEPT_AUDIT_ENFORCE_SECRETS',
+      'ARMORCEPT_ENFORCEMENT',
+      'ARMORCEPT_EXEMPT_TOOLS',
+      'ARMORCEPT_FAIL_OPEN',
+      'ARMORCEPT_INTERACTIVE_OVERRIDE',
+      'ARMORCEPT_LOCAL_DLP_ACTION',
+      'ARMORCEPT_SCAN_TOOL_RESULTS',
+      'ARMORCEPT_SECRET_ENV_VARS',
+      'ARMORCEPT_TOOL_RESULT_ACTION',
+      'WATERFALL_ALWAYS_RUN_CLOUD_DLP',
+    ]);
+  });
+
+  test('the recommended runner config survives ARMORCEPT_AUDIT_ENFORCE_SECRETS=false from the repo', async ($, on) => {
+    const VALUE = 'runner-fake-secret-value-0123456789';
+    const runner = {
+      ARMORCEPT_MODE: 'LOCAL',
+      ARMORCEPT_ENFORCEMENT: 'audit',
+      ARMORCEPT_AUDIT_ENFORCE_SECRETS: 'true',
+      ARMORCEPT_SECRET_ENV_VARS: 'RUNNER_TOKEN',
+    };
+    registerBaseMocks(
+      on,
+      { ...runner, ARMORCEPT_AUDIT_ENFORCE_SECRETS: 'false', ARMORCEPT_SECRET_ENV_VARS: 'OTHER_NAME' },
+      {},
+      {
+        flag: { env: runner },
+        project: { env: { ARMORCEPT_AUDIT_ENFORCE_SECRETS: 'false', ARMORCEPT_SECRET_ENV_VARS: 'OTHER_NAME' } },
+      }
+    );
+    on('process.run', ($, e) => {
+      const out = (stdout: string, exitCode = 0) => ({
+        value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+      });
+      if (e.argv[0] === 'printenv') return e.argv[1] === 'RUNNER_TOKEN' ? out(`${VALUE}\n`) : out('', 1);
+      return out(JSON.stringify({ decision: 'ALLOW', risk_score: 0, confidence: 1, categories: [], dlp_categories: [] }));
+    });
+    const res = await $.tool.call({ tool: 'Bash', command: `echo ${VALUE}` });
+    expect(res.deny).toContain('SECRET_EXACT_RUNNER_TOKEN');
+  });
+
+  test('a repo may add exact-match names but not drop trusted ones', async ($, on) => {
+    const { toasts } = registerBaseMocks(
+      on,
+      { ARMORCEPT_MODE: 'LOCAL', ARMORCEPT_SECRET_ENV_VARS: 'GH_TOKEN,EXTRA_TOKEN' },
+      {},
+      {
+        user: { env: { ARMORCEPT_SECRET_ENV_VARS: 'GH_TOKEN' } },
+        project: { env: { ARMORCEPT_SECRET_ENV_VARS: 'GH_TOKEN,EXTRA_TOKEN' } },
+      }
+    );
+    on('process.run', () => ({
+      value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    }));
+    on('session.start', ($, e) => e);
+    await $.session.start({ cwd: '/workspace', surface: null, isInteractive: false } as never);
+    expect(toasts.some((t) => t.includes('ignoring'))).toBe(false);
+    expect(REPO_ALLOWED_VALUES.ARMORCEPT_SECRET_ENV_VARS?.('GH_TOKEN,EXTRA_TOKEN', 'GH_TOKEN')).toBe(true);
+    expect(REPO_ALLOWED_VALUES.ARMORCEPT_SECRET_ENV_VARS?.('OTHER', 'GH_TOKEN')).toBe(false);
+  });
+
+  test('if the repository layers cannot be read, unconfirmed weakening values are dropped', async ($, on) => {
+    registerBaseMocks(
+      on,
+      { ARMORCEPT_MODE: 'LOCAL', ARMORCEPT_ENFORCEMENT: 'audit' },
+      {},
+      { project: null }
+    );
+    on('process.run', () => ({
+      value: { exitCode: 127, stdout: '', stderr: 'python3: not found', isStdoutTruncated: false, isStderrTruncated: false },
+    }));
+    const res = await $.tool.call({ tool: 'Bash', command: `echo AKIA${'P0O9I8U7Y6T5R4E3'}` });
+    expect(res.deny).toContain('SECRET_LEAK_AWS_ACCESS_KEY');
+  });
+
+  test('a ~/ path with no HOME fails closed instead of resolving inside the repo', () => {
+    expect(() =>
+      buildRuntimeConfig({ ARMORCEPT_MODE: 'LOCAL', ARMORCEPT_EXTRA_PATTERNS: '~/patterns.json' }, '/repo')
+    ).toThrow(/HOME is not set/);
   });
 
   test('a config error from the engine blocks even in audit mode', async ($, on) => {

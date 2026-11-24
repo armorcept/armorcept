@@ -403,6 +403,14 @@ async function callHttpDaemon(
   return parsePromptArmorJson(parsed);
 }
 
+/**
+ * The engine couldn't be started at all: the interpreter or engine file is
+ * missing or not executable (exit 126/127, or the spawn itself failed).
+ * Decided from the exit code and the runtime's own error, never from stderr,
+ * which a payload can influence.
+ */
+export class EngineSpawnError extends Error {}
+
 async function callStdioOneShot(
   $: EngineInterface,
   text: string,
@@ -410,14 +418,28 @@ async function callStdioOneShot(
 ): Promise<PromptArmorResult> {
   const { binary: pythonBin } = await resolvePythonBinary($);
   const daemonPath = `${$.plugin.root}/python/daemon.py`;
-  const proc = await $.process.run(
-    [pythonBin, daemonPath, '--mode', 'stdio', ...engineExtraArgs(cfg)],
-    {
-      stdin: JSON.stringify({ text }) + '\n',
-      timeoutMs: cfg.promptArmorTimeoutMs,
+  let proc;
+  try {
+    proc = await $.process.run(
+      [pythonBin, daemonPath, '--mode', 'stdio', ...engineExtraArgs(cfg)],
+      {
+        stdin: JSON.stringify({ text }) + '\n',
+        timeoutMs: cfg.promptArmorTimeoutMs,
+      }
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/\b(ENOENT|EACCES|ENOEXEC)\b/.test(message)) {
+      throw new EngineSpawnError(`prompt-armor daemon could not start: ${message}`);
     }
-  );
+    throw err;
+  }
 
+  if (proc.exitCode === 126 || proc.exitCode === 127) {
+    throw new EngineSpawnError(
+      `prompt-armor daemon exited ${proc.exitCode}: ${proc.stderr || proc.stdout}`
+    );
+  }
   if (proc.exitCode !== 0) {
     throw new Error(
       `prompt-armor daemon exited ${proc.exitCode}: ${proc.stderr || proc.stdout}`

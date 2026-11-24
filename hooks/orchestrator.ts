@@ -4,7 +4,7 @@
 
 import type { EngineInterface } from 'claude-code';
 import { getLastKnownFailOpen, readRuntimeConfig } from './config';
-import { runModelArmor, runPromptArmor } from './engines';
+import { EngineSpawnError, runModelArmor, runPromptArmor } from './engines';
 import {
   buildHealthRecord,
   getSessionId,
@@ -360,23 +360,15 @@ async function logHealth(
 }
 
 /**
- * A failure of the machine rather than of one payload: the interpreter or the
- * engine file is missing, or can't be run. Crashes, timeouts and malformed
- * output can be caused by the input itself.
- */
-export function isEnvironmentalFailure(reason: string): boolean {
-  return /exited 12[67]\b|ENOENT|EACCES|No such file|not found|command not found/i.test(reason);
-}
-
-/**
  * Whether this failure may open the breaker. While the breaker is open the
  * engine is skipped, which under fail-open means injection isn't scanned. So
- * in fail-open LOCAL mode only environmental failures count, or input that
- * crashes the engine three times would open a 30 s gap for everything after.
+ * in fail-open LOCAL mode only a failure to start the engine counts, or
+ * input that crashes the engine three times would open a 30 s gap for
+ * everything after it.
  */
-function countsTowardBreaker(cfg: RuntimeConfig, reason: string): boolean {
+function countsTowardBreaker(cfg: RuntimeConfig, err: unknown): boolean {
   if (cfg.failOpen && cfg.mode !== 'WATERFALL') {
-    return isEnvironmentalFailure(reason);
+    return err instanceof EngineSpawnError;
   }
   return true;
 }
@@ -384,9 +376,10 @@ function countsTowardBreaker(cfg: RuntimeConfig, reason: string): boolean {
 async function noteEngineFailure(
   $: EngineInterface,
   cfg: RuntimeConfig,
-  reason: string
+  reason: string,
+  err: unknown
 ): Promise<void> {
-  if (countsTowardBreaker(cfg, reason)) {
+  if (countsTowardBreaker(cfg, err)) {
     consecutiveEngineFailures += 1;
   }
   lastEngineFailure = reason;
@@ -440,7 +433,7 @@ async function runGuardedLocalPass(
     await noteEngineSuccess($, cfg);
     return local;
   } catch (err) {
-    await noteEngineFailure($, cfg, shortReason(err));
+    await noteEngineFailure($, cfg, shortReason(err), err);
     throw err;
   }
 }
