@@ -1,6 +1,6 @@
 {
   "name": "armorcept",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Deterministic client-side DLP and prompt injection security mod for Claude Code combining local prompt-armor and Google Cloud Model Armor.",
   "type": "module",
   "main": "./hooks/register.ts",

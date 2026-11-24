@@ -53,7 +53,7 @@ Or inside an interactive Claude Code session:
 A marketplace install does not create the Python environment, so scans use the built-in engine. To enable the full `prompt-armor` engine, create the virtual environment inside the installed plugin folder:
 
 ```bash
-cd ~/.claude/plugins/cache/armorcept/armorcept/0.2.1
+cd ~/.claude/plugins/cache/armorcept/armorcept/0.2.2
 python3 -m venv .venv
 .venv/bin/pip install -r python/requirements.txt
 ```
