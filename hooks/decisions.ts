@@ -44,14 +44,18 @@ export interface DecisionRecord {
 }
 
 /**
- * In audit mode a BLOCK is recorded but not enforced. The one exception is an
- * exact secret match when ARMORCEPT_AUDIT_ENFORCE_SECRETS=true.
+ * In audit mode a BLOCK is recorded but not enforced. Two exceptions: a
+ * configuration error (a bad ARMORCEPT_EXTRA_PATTERNS file), which blocks in
+ * every mode, and an exact secret match when ARMORCEPT_AUDIT_ENFORCE_SECRETS=true.
  */
 export function isAuditBypassed(
   cfg: RuntimeConfig | undefined,
   verdict: EvaluationVerdict
 ): boolean {
   if (cfg?.enforcement !== 'audit' || verdict.decision !== 'BLOCK') {
+    return false;
+  }
+  if (verdict.findings.some((f) => f.startsWith('ARMORCEPT_CONFIG_ERROR'))) {
     return false;
   }
   return !(cfg.auditEnforceSecrets && verdict.source === 'ArmorCept Secrets');
@@ -182,7 +186,19 @@ async function writeBatch(
   }
   try {
     const res = await $.process.run(
-      ['sh', '-c', 'umask 077; cat >> "$1"', 'armorcept-log', path],
+      [
+        'sh',
+        '-c',
+        // Same contract as python/decision_log.py: create the directory,
+        // rotate to <path>.1 past max bytes (0 disables), then append.
+        'umask 077; [ -L "$1" ] && exit 1; mkdir -p "$(dirname "$1")" || exit 1; size=0; ' +
+          '[ -f "$1" ] && size=$(($(wc -c < "$1"))); ' +
+          'if [ "$2" -gt 0 ] && [ "$size" -ge "$2" ]; then mv -f "$1" "$1.1"; fi; ' +
+          'cat >> "$1"',
+        'armorcept-log',
+        path,
+        String(cfg.decisionLogMaxBytes),
+      ],
       { stdin: data, timeoutMs: 5000 }
     );
     if (res.exitCode === 0) return;

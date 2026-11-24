@@ -166,6 +166,22 @@ class SpanTests(unittest.TestCase):
         self.assertEqual(self.engine.analyze("clean")["dlp_spans"], [])
 
 
+class PrivateKeySpanTests(unittest.TestCase):
+    """A private-key match covers only the PEM header, so it must get no span."""
+
+    def test_private_key_is_reported_without_a_span(self) -> None:
+        engine = daemon.WarmPromptArmorEngine()
+        body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCfaketestbody0123456789"
+        pem = "-----BEGIN " + "PRIVATE KEY-----\n" + body + "\n-----END PRIVATE KEY-----"
+        for text in (pem, '{"private_key": "' + pem.replace("\n", "\\n") + '"}'):
+            result = engine.analyze("cat key\n" + text)
+            self.assertIn("SECRET_LEAK_PRIVATE_KEY", result["dlp_categories"])
+            self.assertFalse(
+                any(s[0] == "SECRET_LEAK_PRIVATE_KEY" for s in result["dlp_spans"]),
+                result["dlp_spans"],
+            )
+
+
 class ExtraPatternTests(unittest.TestCase):
     def write(self, content: object) -> str:
         fd, path = tempfile.mkstemp(suffix=".json")
@@ -195,6 +211,8 @@ class ExtraPatternTests(unittest.TestCase):
             "name must be": [{"name": "lower", "regex": "x"}],
             "duplicate name": [{"name": "DUP", "regex": "a"}, {"name": "DUP", "regex": "b"}],
             "empty string": [{"name": "EMPTY", "regex": "a*"}],
+            "nested quantifier": [{"name": "REDOS", "regex": "(x+)+y"}],
+            "redactable must be": [{"name": "FLAG", "regex": "x", "redactable": "yes"}],
             "risk must be": [{"name": "RISKY", "regex": "x", "risk": 2}],
             "expected a JSON list": {"nope": []},
             "invalid JSON": "{not json",

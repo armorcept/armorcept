@@ -103,6 +103,19 @@ Configure ArmorCept in `.claude/settings.json` (or enterprise managed policy set
 }
 ```
 
+### Settings a repository can't weaken
+
+Claude Code applies the `env` block of a checked-out repository's own `.claude/settings.json` and `.claude/settings.local.json`. A repository you don't trust could use that to switch ArmorCept off. So ArmorCept ignores these variables when only the repository's settings set them:
+
+- `ARMORCEPT_ENFORCEMENT=audit`, `ARMORCEPT_FAIL_OPEN=true` and `ARMORCEPT_INTERACTIVE_OVERRIDE=true`
+- a non-empty `ARMORCEPT_EXEMPT_TOOLS` or `ARMORCEPT_ALLOWLIST_PATHS`
+- `ARMORCEPT_LOCAL_DLP_ACTION` set to anything but `block`
+- any value of `ARMORCEPT_MODE`, `ARMORCEPT_EXTRA_PATTERNS`, `ARMORCEPT_DECISION_LOG`, `PROMPT_ARMOR_ENDPOINT`, the `WATERFALL_*` thresholds, `MODEL_ARMOR_TEMPLATE_ID`, `GOOGLE_CLOUD_ACCESS_TOKEN` and `GOOGLE_APPLICATION_CREDENTIALS`
+
+The value is kept when managed policy, your user settings (`~/.claude/settings.json`) or `--settings` give the same value. A toast at session start names each variable that was ignored. Settings that only add protection, such as `ARMORCEPT_SCAN_TOOL_RESULTS=true` or `ARMORCEPT_SECRET_ENV_VARS`, still apply from a repository.
+
+If you keep ArmorCept's settings in your own projects' `.claude/settings.json`, set `ARMORCEPT_TRUST_PROJECT_SETTINGS=true` in your user settings, managed policy or `--settings`. This variable is never read from a repository's settings.
+
 ### Environment Variables Reference
 
 | Variable | Default | Description |
@@ -110,6 +123,7 @@ Configure ArmorCept in `.claude/settings.json` (or enterprise managed policy set
 | `ARMORCEPT_MODE` | `WATERFALL` (with GCP config) or `LOCAL` | Execution mode: `LOCAL`, `CLOUD`, or `WATERFALL`. |
 | `ARMORCEPT_FAIL_OPEN` | `false` | When `false` (default), engine timeouts, crashes, or malformed responses block execution (fail-closed), including via `.catch` handlers on gating hooks. When the local engine can't run, secrets are still checked in-process whatever this says; see [When the engine can't run](#when-the-engine-cant-run). |
 | `ARMORCEPT_ENFORCEMENT` | `enforce` | `audit` records every verdict and never blocks or withholds. See [Audit mode and the decision log](#audit-mode-and-the-decision-log). |
+| `ARMORCEPT_TRUST_PROJECT_SETTINGS` | `false` | Read from user settings, managed policy or `--settings` only. When `true`, a repository's `.claude/settings.json` may set the variables listed in [Settings a repository can't weaken](#settings-a-repository-cant-weaken). |
 | `ARMORCEPT_AUDIT_ENFORCE_SECRETS` | `false` | In `audit` mode, keep blocking exact secret matches from `ARMORCEPT_SECRET_ENV_VARS`. |
 | `ARMORCEPT_DECISION_LOG` | *(unset)* | Path of a JSONL file that gets one line per verdict, in either enforcement mode (supports `~/` and session-relative paths). |
 | `ARMORCEPT_DECISION_LOG_MAX_BYTES` | `10485760` | Rotate the decision log to `<path>.1` (one old file kept) when it would grow past this size. `0` disables rotation. |
@@ -141,7 +155,7 @@ If the Python engine can't produce a result, ArmorCept keeps protecting secrets 
 
 - **Secrets:** the built-in secret and DLP patterns run in-process (`hooks/dlp.ts`), as do exact matches from `ARMORCEPT_SECRET_ENV_VARS`. They block as usual, with `engine_mode: "ts-fallback"`. Custom `ARMORCEPT_EXTRA_PATTERNS` are Python regexes, so they need the engine.
 - **Injection:** in `WATERFALL` mode, injection checks go to Model Armor. In `LOCAL` mode they follow `ARMORCEPT_FAIL_OPEN`. Fail-closed (the default) blocks with `ArmorCept engine unavailable (<reason>)`, and the message tells the model this is not a security finding. Fail-open allows the action.
-- **Circuit breaker:** after three failures in a row, ArmorCept stops calling the engine for 30 seconds and then tries it again, so a hung engine doesn't add a full timeout to every call.
+- **Circuit breaker:** after three failures in a row, ArmorCept stops calling the engine for 30 seconds and then tries it again, so a hung engine doesn't add a full timeout to every call. With `ARMORCEPT_FAIL_OPEN=true` in `LOCAL` mode, a skipped engine means injection isn't scanned, so there only failures of the machine count (a missing interpreter or engine file). Crashes and timeouts, which a payload can cause, don't open the breaker.
 - **Visibility:** a toast and the status bar (`Degraded (engine unavailable — secrets only)`) show the outage, and recovery is announced. With `ARMORCEPT_DECISION_LOG` set, `engine.health` lines record `engine_unavailable` and `engine_recovered`.
 
 ## Headless and Agent Runners
@@ -151,7 +165,7 @@ ArmorCept works in headless Claude Code (`claude -p`, `--output-format stream-js
 - `$.ui.ask` overrides never happen. A block stays a block, and the model receives the deny message.
 - Toasts and the status bar go nowhere, so use the decision log to see what happened.
 
-Recommended `env` for an unattended runner:
+Recommended `env` for an unattended runner. Put it in the runner's user settings or pass it with `--settings`, not in the checked-out repository, whose settings can't set most of these (see [Settings a repository can't weaken](#settings-a-repository-cant-weaken)):
 
 ```json
 {
@@ -171,7 +185,7 @@ Start in `audit` mode with secrets enforced, review the log (see [Measuring fals
 
 **Expected latency.** With the warm worker, a scan adds single-digit milliseconds with the built-in engine (in CI, p50 around 4 ms and p95 around 30 ms) and typically under 30 ms with `prompt-armor`. The worker starts at `session.start`. Until it's ready (at most 3.5 s), calls use one-shot `stdio` scans, which take about 1.5–4 s each with `prompt-armor` installed. Result scanning (`ARMORCEPT_SCAN_TOOL_RESULTS`) adds a second scan per tool call.
 
-`npm run test:headless` runs real `claude -p` sessions with the plugin loaded against a local stub model (`scripts/headless/`). It checks that the worker starts, that a secret in a tool call is blocked, that one in a tool result is redacted or withheld, that exact env-var values and audit mode work, and that a clean session runs through. It needs no API key and makes no network calls; CI runs it on the pinned Claude Code version.
+`npm run test:headless` runs real `claude -p` sessions with the plugin loaded against a local stub model (`scripts/headless/`). It checks that the worker starts, that a secret in a tool call is blocked, that a repository's `.claude/settings.json` can't switch audit mode on, that one in a tool result is redacted or withheld, that exact env-var values and audit mode work, and that a clean session runs through. It needs no API key and makes no network calls; CI runs it on the pinned Claude Code version.
 
 ## Redacting Tool Results
 
@@ -181,7 +195,9 @@ By default, one DLP hit withholds a whole tool result. With a long build or test
 deploying with key [REDACTED:SECRET_LEAK_AWS_ACCESS_KEY] to us-east-1 ... done (42 tests passed)
 ```
 
-- Redaction covers DLP patterns, custom patterns and exact secret matches, because the engine reports exactly where each one is. Spans found in overlapping 8 KiB chunks are merged, so a match that crosses a chunk boundary is redacted once.
+- Redaction covers DLP patterns and exact secret matches, because the engine reports exactly where each one is. Spans found in overlapping 8 KiB chunks are merged, so a match that crosses a chunk boundary is redacted once.
+- **Private keys are always withheld whole.** The `SECRET_LEAK_PRIVATE_KEY` pattern matches only the `-----BEGIN … PRIVATE KEY-----` header, so replacing the match would leave the key body in the result.
+- Custom patterns are withheld whole too, unless the entry sets `"redactable": true`. Set it only when the regex matches the entire secret, not just its prefix.
 - After redacting, ArmorCept scans the result again, and returns it only if nothing is left to block.
 - Prompt-injection findings and Model Armor findings have no reliable span, so a result containing one is still withheld whole.
 - A redacted result is logged with `"action": "redacted"`. Audit mode (`ARMORCEPT_ENFORCEMENT=audit`) records the verdict and changes nothing.
@@ -193,6 +209,8 @@ deploying with key [REDACTED:SECRET_LEAK_AWS_ACCESS_KEY] to us-east-1 ... done (
 - `ARMORCEPT_DECISION_LOG=<path>` appends one JSON line per verdict, for prompts, tool calls and tool results.
 - `ARMORCEPT_ENFORCEMENT=audit` records every verdict but never blocks or withholds anything, including on engine errors. Each would-be block shows an `[ArmorCept Audit — would block]` toast. With `ARMORCEPT_AUDIT_ENFORCE_SECRETS=true`, exact secret matches still block.
 
+> **Audit mode switches off fail-closed.** Injection findings, secret-pattern findings and "engine unavailable" blocks are all let through. The one exception is a bad `ARMORCEPT_EXTRA_PATTERNS` file (`ARMORCEPT_CONFIG_ERROR`), which blocks in every mode. A repository's own settings can't turn audit mode on; see [Settings a repository can't weaken](#settings-a-repository-cant-weaken).
+
 A log line looks like this:
 
 ```json
@@ -201,7 +219,7 @@ A log line looks like this:
 
 `decision` is what the engine recommended. `action` is what ArmorCept did: `allowed`, `warned`, `blocked`, `withheld`, `redacted`, `overridden` or `audited`. Lines never contain the payload, the matched text or a secret value. For engine errors, the categories hold only `ENGINE_ERROR`, and a short `error` field holds the error message with any loaded secret value redacted.
 
-Lines are buffered in memory and appended by a short-lived local process off the hook's critical path, then flushed at `session.end`. The file is created with mode `0600`.
+Lines are buffered in memory and appended by a short-lived local process off the hook's critical path, then flushed at `session.end`. The file is created with mode `0600`. The writer is `python/decision_log.py`; if Python can't run, a `sh` fallback creates the directory and rotates the file the same way.
 
 ### Measuring false positives before you turn blocking on
 
@@ -259,10 +277,11 @@ Set `ARMORCEPT_EXTRA_PATTERNS` to a JSON file holding a list of patterns (or `{"
 ```
 
 - `name`: 3–64 characters of `A-Z`, `0-9` and `_`. Matches are reported as `CUSTOM_<name>`.
-- `regex`: a Python regular expression, at most 1,000 characters, that must not match the empty string.
+- `regex`: a Python regular expression, at most 1,000 characters, that must not match the empty string. A quantified group that holds a quantifier, such as `(a+)+` or `(\w+\s?)*`, is refused: Python's `re` has no timeout, and that is the usual shape of catastrophic backtracking. The check is a heuristic, so keep patterns simple and anchored to a literal prefix.
 - `risk` and `confidence` (optional, default `0.95`): numbers in `(0, 1]`. A risk of `0.75` or more blocks.
+- `redactable` (optional, default `false`): set to `true` when the regex matches the entire secret, so `ARMORCEPT_TOOL_RESULT_ACTION=redact` can replace it. Otherwise a tool result holding a match is withheld whole.
 
-The file is validated when the engine starts. If it can't be read or any entry is invalid, every scan is blocked with `ARMORCEPT_CONFIG_ERROR: invalid ARMORCEPT_EXTRA_PATTERNS: …`, which names the bad entry but never echoes its regex. This happens even with `ARMORCEPT_FAIL_OPEN=true`, so a typo can't quietly switch your rules off. Custom patterns don't apply in `CLOUD` mode, which doesn't run the local engine.
+The file is validated when the engine starts. If it can't be read or any entry is invalid, every scan is blocked with `ARMORCEPT_CONFIG_ERROR: invalid ARMORCEPT_EXTRA_PATTERNS: …`, which names the bad entry but never echoes its regex. This happens even with `ARMORCEPT_FAIL_OPEN=true`, so a typo can't quietly switch your rules off. Custom patterns don't apply in `CLOUD` mode, which doesn't run the local engine. A repository's own settings can't set `ARMORCEPT_EXTRA_PATTERNS`.
 
 ## Development & Verification
 

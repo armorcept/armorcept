@@ -34,7 +34,9 @@ def main() -> int:
     if max_bytes > 0 and size > 0 and size + len(data) > max_bytes:
         os.replace(path, path + ".1")
 
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    # O_NOFOLLOW: a symlink planted at the log path is refused, not followed
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
     try:
         os.write(fd, data)
     finally:

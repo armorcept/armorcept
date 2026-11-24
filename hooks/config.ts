@@ -312,6 +312,7 @@ export function buildRuntimeConfig(
     allowlistPaths: parseCsvList(raw.ARMORCEPT_ALLOWLIST_PATHS),
     extraPatternsPath,
     secretEnvVars,
+    ignoredRepoSettings: [],
     googleApplicationCredentials,
     googleCloudAccessToken: stripQuotes(raw.GOOGLE_CLOUD_ACCESS_TOKEN),
     googleCloudProject,
@@ -319,6 +320,101 @@ export function buildRuntimeConfig(
     modelArmorTemplateId,
     modelArmorTimeoutMs,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Settings a repository may not weaken
+// ---------------------------------------------------------------------------
+
+type SettingsLayerSource = 'user' | 'project' | 'local' | 'flag' | 'policy';
+
+const truthy = (v: string): boolean =>
+  ['true', '1', 'yes'].includes((stripQuotes(v) ?? '').trim().toLowerCase());
+const nonEmpty = (v: string): boolean => (stripQuotes(v) ?? '').trim() !== '';
+const always = (): boolean => true;
+
+/**
+ * Variables that a checked-out repository's own `.claude/settings.json` or
+ * `.claude/settings.local.json` must not set, because the value switches
+ * protection off, routes scans to another endpoint or project, or picks the
+ * code that decides. Each predicate says which values count as weakening.
+ */
+export const REPO_GUARDED_SETTINGS: Readonly<Record<string, (value: string) => boolean>> = {
+  ARMORCEPT_ENFORCEMENT: (v) => (stripQuotes(v) ?? '').trim().toLowerCase() === 'audit',
+  ARMORCEPT_FAIL_OPEN: truthy,
+  ARMORCEPT_INTERACTIVE_OVERRIDE: truthy,
+  ARMORCEPT_EXEMPT_TOOLS: nonEmpty,
+  ARMORCEPT_ALLOWLIST_PATHS: nonEmpty,
+  ARMORCEPT_LOCAL_DLP_ACTION: (v) => (stripQuotes(v) ?? '').trim().toLowerCase() !== 'block',
+  ARMORCEPT_TOOL_RESULT_ACTION: (v) => (stripQuotes(v) ?? '').trim().toLowerCase() !== 'withhold',
+  ARMORCEPT_MODE: always,
+  ARMORCEPT_EXTRA_PATTERNS: always,
+  ARMORCEPT_DECISION_LOG: always,
+  PROMPT_ARMOR_ENDPOINT: always,
+  WATERFALL_ALLOW_BELOW: always,
+  WATERFALL_BLOCK_ABOVE: always,
+  WATERFALL_MIN_CONFIDENCE: always,
+  MODEL_ARMOR_TEMPLATE_ID: always,
+  GOOGLE_CLOUD_ACCESS_TOKEN: always,
+  GOOGLE_APPLICATION_CREDENTIALS: always,
+};
+
+async function readLayerEnv(
+  $: EngineInterface,
+  source: SettingsLayerSource
+): Promise<Record<string, string>> {
+  try {
+    const layer: unknown = await $.settings.read({ source });
+    if (!layer || typeof layer !== 'object' || !('env' in layer)) return {};
+    const env = (layer as { env?: unknown }).env;
+    if (!env || typeof env !== 'object') return {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(env as Record<string, unknown>)) {
+      if (v !== undefined && v !== null) out[k] = String(v);
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Drops guarded values that only a repository's settings supply. A value
+ * stays when managed policy, user settings or `--settings` give the same
+ * value, or when one of those sets ARMORCEPT_TRUST_PROJECT_SETTINGS=true.
+ * Returns the names dropped; `raw` is changed in place.
+ */
+export async function dropRepoWeakenedSettings(
+  $: EngineInterface,
+  raw: RawConfigEnv,
+  policyEnv: Record<string, string>
+): Promise<string[]> {
+  const [user, project, local, flag] = await Promise.all([
+    readLayerEnv($, 'user'),
+    readLayerEnv($, 'project'),
+    readLayerEnv($, 'local'),
+    readLayerEnv($, 'flag'),
+  ]);
+  const trustFlag =
+    policyEnv['ARMORCEPT_TRUST_PROJECT_SETTINGS'] ??
+    flag['ARMORCEPT_TRUST_PROJECT_SETTINGS'] ??
+    user['ARMORCEPT_TRUST_PROJECT_SETTINGS'];
+  if (trustFlag !== undefined && truthy(trustFlag)) return [];
+
+  const dropped: string[] = [];
+  const rec = raw as Record<string, string | undefined>;
+  for (const [name, weakens] of Object.entries(REPO_GUARDED_SETTINGS)) {
+    if (name in policyEnv) continue;
+    const repoValue = local[name] ?? project[name];
+    if (repoValue === undefined) continue;
+    const effective = rec[name];
+    if (effective === undefined || effective !== repoValue) continue;
+    if (flag[name] === repoValue || user[name] === repoValue) continue;
+    if (!weakens(repoValue)) continue;
+    rec[name] = flag[name] ?? user[name];
+    dropped.push(name);
+  }
+  return dropped;
 }
 
 export async function readRuntimeConfig(
@@ -329,13 +425,7 @@ export async function readRuntimeConfig(
     return cachedConfig;
   }
 
-  // Read fail-open first so lastKnownFailOpen is updated even if another variable fails validation
   const rawFailOpen = await $.env.get('ARMORCEPT_FAIL_OPEN');
-  try {
-    lastKnownFailOpen = parseBool(rawFailOpen, false);
-  } catch {
-    lastKnownFailOpen = false;
-  }
 
   const [
     rawMode,
@@ -419,8 +509,7 @@ export async function readRuntimeConfig(
     // Managed policy source may not be present in test or standalone runs
   }
 
-  const cfg = buildRuntimeConfig(
-    {
+  const raw: RawConfigEnv = {
       ARMORCEPT_MODE: policyEnv['ARMORCEPT_MODE'] ?? rawMode,
       ARMORCEPT_FAIL_OPEN: policyEnv['ARMORCEPT_FAIL_OPEN'] ?? rawFailOpen,
       PROMPT_ARMOR_ENDPOINT:
@@ -474,9 +563,17 @@ export async function readRuntimeConfig(
       MODEL_ARMOR_TIMEOUT_MS:
         policyEnv['MODEL_ARMOR_TIMEOUT_MS'] ?? rawCloudTimeout,
       HOME: rawHome,
-    },
-    sessionCwd
-  );
+  };
+  const ignoredRepoSettings = await dropRepoWeakenedSettings($, raw, policyEnv);
+  // Set before validation, so lastKnownFailOpen is current even if another
+  // variable fails validation, and only from a value that passed the guard
+  try {
+    lastKnownFailOpen = parseBool(raw.ARMORCEPT_FAIL_OPEN, false);
+  } catch {
+    lastKnownFailOpen = false;
+  }
+  const cfg = buildRuntimeConfig(raw, sessionCwd);
+  cfg.ignoredRepoSettings = ignoredRepoSettings;
 
   // If cloud mode is active, disallow interactive override unless explicitly permitted by managed policy
   let policyAllowsInteractiveOverride = false;

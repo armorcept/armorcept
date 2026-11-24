@@ -55,10 +55,19 @@ export function applyRedactions(text: string, spans: readonly MatchSpan[]): stri
   return out + text.slice(cursor);
 }
 
+/**
+ * Categories whose match doesn't cover the secret, so replacing the match
+ * would leave the secret in place. The PEM private-key pattern matches only
+ * the BEGIN header; the key body has no pattern of its own. The engines
+ * already report no span for these; this is the backstop.
+ */
+export const UNREDACTABLE_CATEGORIES: ReadonlySet<string> = new Set(['SECRET_LEAK_PRIVATE_KEY']);
+
 /** A BLOCK can be redacted only when every finding is a category with a known span. */
 export function isRedactable(verdict: EvaluationVerdict): boolean {
   const spans = verdict.spans ?? [];
   if (verdict.decision !== 'BLOCK' || spans.length === 0) return false;
+  if (verdict.findings.some((f) => UNREDACTABLE_CATEGORIES.has(f))) return false;
   const spanned = new Set(spans.map((s) => s.category));
   return verdict.findings.length > 0 && verdict.findings.every((f) => spanned.has(f));
 }

@@ -47,6 +47,18 @@ class DecisionLogWriterTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path + ".2"))
         self.assertLessEqual(os.path.getsize(self.path), 100)
 
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "needs O_NOFOLLOW")
+    def test_refuses_a_symlink_at_the_log_path(self) -> None:
+        target = os.path.join(self.dir.name, "victim.txt")
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write("original\n")
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        os.symlink(target, self.path)
+        with self.assertRaises(subprocess.CalledProcessError):
+            append(self.path, '{"a":1}\n', 0)
+        with open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "original\n")
+
     def test_empty_input_is_a_no_op(self) -> None:
         append(self.path, "", 0)
         self.assertFalse(os.path.exists(self.path))

@@ -3,6 +3,21 @@
 // The value after the = sign must stay plain JSON.
 export const DLP_CASES = [
   {
+    "prefix": "\u00e9AKIA",
+    "n": 16,
+    "alphabet": "ABC7",
+    "suffix": "\u00e9",
+    "category": "SECRET_LEAK_AWS_ACCESS_KEY",
+    "hit": true
+  },
+  {
+    "prefix": "\u0663\u0663\u0663-\u0663\u0663-",
+    "n": 4,
+    "alphabet": "1234",
+    "category": "DLP_US_SSN",
+    "hit": false
+  },
+  {
     "prefix": "AKIA",
     "n": 16,
     "alphabet": "ABC7",

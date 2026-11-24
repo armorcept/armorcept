@@ -15,6 +15,8 @@ interface FallbackPattern {
   regex: RegExp;
   risk: number;
   confidence: number;
+  /** False when a match doesn't cover the whole secret; such matches get no span. */
+  redactable: boolean;
 }
 
 const TOKEN_END = '(?![A-Za-z0-9_\\-])';
@@ -23,9 +25,10 @@ function pattern(
   source: string,
   category: string,
   risk: number,
-  confidence: number
+  confidence: number,
+  redactable = true
 ): FallbackPattern {
-  return { category, regex: new RegExp(source, 'g'), risk, confidence };
+  return { category, regex: new RegExp(source, 'g'), risk, confidence, redactable };
 }
 
 export const FALLBACK_DLP_PATTERNS: readonly FallbackPattern[] = [
@@ -61,7 +64,8 @@ export const FALLBACK_DLP_PATTERNS: readonly FallbackPattern[] = [
     '-----BEGIN (RSA |EC |OPENSSH |DSA |ENCRYPTED |PRIVATE )?PRIVATE KEY-----',
     'SECRET_LEAK_PRIVATE_KEY',
     0.98,
-    0.99
+    0.99,
+    false // matches only the PEM header, so the result is withheld whole
   ),
   pattern('\\b(?!000|666|9\\d{2})\\d{3}-(?!00)\\d{2}-(?!0000)\\d{4}\\b', 'DLP_US_SSN', 0.91, 0.93),
 ];
@@ -83,7 +87,7 @@ export function scanFallbackDlp(text: string): PromptArmorResult {
     for (const m of text.matchAll(p.regex)) {
       if (m[0].length === 0) continue;
       hit = true;
-      if (spans.length < MAX_SPANS) {
+      if (p.redactable && spans.length < MAX_SPANS) {
         const start = m.index ?? 0;
         spans.push({ category: p.category, start, end: start + m[0].length });
       }

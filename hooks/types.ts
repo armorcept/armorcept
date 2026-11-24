@@ -55,6 +55,8 @@ export interface RuntimeConfig {
   extraPatternsPath?: string;
   /** Names (not values) of environment variables whose values are matched exactly. */
   secretEnvVars: readonly string[];
+  /** Guarded settings dropped because only a repository's settings set them. */
+  ignoredRepoSettings: string[];
   googleApplicationCredentials?: string;
   googleCloudAccessToken?: string;
   googleCloudProject?: string;

@@ -171,6 +171,14 @@ export const register: Register = (on: On): void => {
       const skippedSecrets = cfg.secretEnvVars.filter(
         (name) => !loadedSecrets.includes(name)
       );
+      if (cfg.ignoredRepoSettings.length > 0) {
+        safeUi(() =>
+          $.ui.toast(
+            `⚠️ ArmorCept: ignoring ${cfg.ignoredRepoSettings.join(', ')} from this repository's .claude settings. Set them in your user settings, managed policy or --settings instead.`,
+            { timeoutMs: 8000 }
+          )
+        );
+      }
       if (skippedSecrets.length > 0) {
         safeUi(() =>
           $.ui.toast(

@@ -11,7 +11,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +24,8 @@ const claudeBin = process.argv.includes('--claude')
 
 // Fake credentials, assembled at run time
 const FAKE_AWS_KEY = `AKIA${'HEADLESSTEST0001'}`;
+const PEM_BODY = 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCheadlessfakekeybody0123456789';
+const FAKE_PEM = `-----BEGIN ${'PRIVATE'} KEY-----\n${PEM_BODY}\n-----END ${'PRIVATE'} KEY-----\n`;
 const RUNNER_SECRET = `armorcept-headless-${process.pid}-${Date.now()}-runner-secret`;
 
 const scenarios = [
@@ -60,6 +62,23 @@ const scenarios = [
     ],
   },
   {
+    name: 'a private key in a tool result is withheld whole, even in redact mode',
+    env: { ARMORCEPT_SCAN_TOOL_RESULTS: 'true', ARMORCEPT_TOOL_RESULT_ACTION: 'redact' },
+    setup: (work) => {
+      writeFileSync(join(work, 'id_key.pem'), FAKE_PEM);
+      writeFileSync(
+        join(work, 'sa.json'),
+        JSON.stringify({ type: 'service_account', private_key: FAKE_PEM })
+      );
+    },
+    steps: ['cat id_key.pem', 'cat sa.json'],
+    check: ({ record }) => [
+      ['PEM file withheld', record.toolResults[0]?.text.includes('output withheld by ArmorCept')],
+      ['service-account JSON withheld', record.toolResults[1]?.text.includes('output withheld by ArmorCept')],
+      ['key body never reached the model', !JSON.stringify(record).includes(PEM_BODY)],
+    ],
+  },
+  {
     name: 'tool result with a fake secret is withheld by default',
     env: { ARMORCEPT_SCAN_TOOL_RESULTS: 'true' },
     setup: (work) => writeFileSync(join(work, 'config.txt'), `key=${FAKE_AWS_KEY}\n`),
@@ -82,6 +101,23 @@ const scenarios = [
       ['value redacted', record.toolResults[0]?.text.includes('[REDACTED:SECRET_EXACT_RUNNER_SECRET]')],
       ['value never reached the model', !JSON.stringify(record).includes(RUNNER_SECRET)],
       ['value never in the decision log', !readLog(work).includes(RUNNER_SECRET)],
+    ],
+  },
+  {
+    name: "a repo's own .claude/settings.json cannot switch on audit mode",
+    env: {},
+    setup: (work) => {
+      mkdirSync(join(work, '.claude'), { recursive: true });
+      writeFileSync(
+        join(work, '.claude', 'settings.json'),
+        JSON.stringify({ env: { ARMORCEPT_ENFORCEMENT: 'audit' } })
+      );
+    },
+    steps: [`echo ${FAKE_AWS_KEY} > repo-audit.txt`],
+    check: ({ record, work }) => [
+      ['call still blocked', record.toolResults[0]?.text.includes('blocked by ArmorCept')],
+      ['command never ran', !existsSync(join(work, 'repo-audit.txt'))],
+      ['logged as enforce', logLines(work).some((l) => l.action === 'blocked' && l.enforcement === 'enforce')],
     ],
   },
   {

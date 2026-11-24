@@ -22,7 +22,8 @@ import {
 function registerBaseMocks(
   on: Parameters<typeof mock.env>[0],
   envVars: Record<string, string>,
-  toolOutputs: Record<string, string> = {}
+  toolOutputs: Record<string, string> = {},
+  settingsLayers: Partial<Record<string, { env?: Record<string, string> }>> = {}
 ): {
   toasts: string[];
   statuses: (string | undefined)[];
@@ -35,7 +36,10 @@ function registerBaseMocks(
   const logs: string[] = [];
 
   mock.env(on, envVars);
-  on('settings.read', () => ({ value: {} }));
+  on('settings.read', ($, e) => {
+    const source = (e as unknown as { source?: string }).source;
+    return { value: (source ? settingsLayers[source] : undefined) ?? {} };
+  });
   on('session.cwd', () => ({ value: '/workspace' }));
   on('fs.exists', () => ({ value: true }));
   on('ui.status', ($, e) => {
@@ -1451,6 +1455,64 @@ describe('ArmorCept — Tool result redaction (ARMORCEPT_TOOL_RESULT_ACTION=reda
     expect(res.result).toBeUndefined();
   });
 
+  // A fake PEM key, assembled at test time. The body lines must never reach the model.
+  const PEM_BODY = ['MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDfaketest', 'Zm9yIHRlc3Rpbmcgb25seSBub3QgYSByZWFsIGtleSBhdCBhbGwgMDEyMzQ1Njc']; 
+  const PEM = `-----BEGIN ${'PRIVATE'} KEY-----\n${PEM_BODY.join('\n')}\n-----END ${'PRIVATE'} KEY-----\n`;
+  const SA_JSON = JSON.stringify({ type: 'service_account', private_key: PEM });
+
+  test('redact mode withholds private keys whole, even if the engine reports a header span', async ($, on) => {
+    registerBaseMocks(
+      on,
+      { ARMORCEPT_MODE: 'LOCAL', ARMORCEPT_SCAN_TOOL_RESULTS: 'true', ARMORCEPT_TOOL_RESULT_ACTION: 'redact' },
+      { 'cat id_rsa': `note\n${PEM}`, 'cat sa.json': SA_JSON }
+    );
+    on('process.run', ($, e) => {
+      const { text } = JSON.parse(e.init?.stdin ?? '{}') as { text: string };
+      const at = text.indexOf('-----BEGIN');
+      const hit = at >= 0;
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            decision: hit ? 'BLOCK' : 'ALLOW',
+            risk_score: hit ? 0.98 : 0.01,
+            confidence: 0.99,
+            categories: hit ? ['SECRET_LEAK_PRIVATE_KEY'] : [],
+            dlp_categories: hit ? ['SECRET_LEAK_PRIVATE_KEY'] : [],
+            // An engine that (wrongly) spans only the header
+            dlp_spans: hit ? [['SECRET_LEAK_PRIVATE_KEY', at, at + 27]] : [],
+          }),
+          stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      };
+    });
+    for (const command of ['cat id_rsa', 'cat sa.json']) {
+      const res = await $.tool.call({ tool: 'Bash', command });
+      expect(res.deny).toContain('output withheld');
+      const seen = JSON.stringify(res);
+      for (const line of PEM_BODY) expect(seen.includes(line)).toBe(false);
+    }
+  });
+
+  test('the in-process fallback reports no span for a private key, so it is withheld too', async ($, on) => {
+    expect(scanFallbackDlp(PEM).findings).toContain('SECRET_LEAK_PRIVATE_KEY');
+    expect(scanFallbackDlp(PEM).dlpSpans).toEqual([]);
+    registerBaseMocks(
+      on,
+      { ARMORCEPT_MODE: 'LOCAL', ARMORCEPT_SCAN_TOOL_RESULTS: 'true', ARMORCEPT_TOOL_RESULT_ACTION: 'redact' },
+      { 'cat id_rsa': PEM }
+    );
+    on('process.run', () => ({
+      value: { exitCode: 127, stdout: '', stderr: 'python3: not found', isStdoutTruncated: false, isStderrTruncated: false },
+    }));
+    const res = await $.tool.call({ tool: 'Bash', command: 'cat id_rsa' });
+    // The call itself is blocked fail-closed (engine missing), before any output exists
+    const seen = JSON.stringify(res);
+    for (const line of PEM_BODY) expect(seen.includes(line)).toBe(false);
+  });
+
   test('exact secret values are redacted too, including when the engine finds nothing', async ($, on) => {
     const VALUE = 'redact-fake-secret-value-987654321';
     registerBaseMocks(
@@ -1671,5 +1733,138 @@ describe('ArmorCept — In-process DLP fallback when the Python engine cannot ru
     const secret = await $.tool.call({ tool: 'Bash', command: `aws --key ${KEY}` });
     expect(secret.deny).toContain('SECRET_LEAK_AWS_ACCESS_KEY');
     expect(cloudCalls).toBe(1);
+  });
+  test('fail-open: crashes do not open the breaker', async ($, on) => {
+    registerBaseMocks(on, { ARMORCEPT_MODE: 'LOCAL', ARMORCEPT_FAIL_OPEN: 'true' });
+    const engine = failingEngine(on, 'crash');
+    for (let i = 0; i < 6; i += 1) {
+      await $.tool.call({ tool: 'Bash', command: `echo ${i}` });
+    }
+    // Input-caused failures never skip the engine for the calls after them
+    expect(engine.engineCalls()).toBe(6);
+  });
+
+  test('fail-open: a missing interpreter still opens the breaker', async ($, on) => {
+    registerBaseMocks(on, { ARMORCEPT_MODE: 'LOCAL', ARMORCEPT_FAIL_OPEN: 'true' });
+    const engine = failingEngine(on, 'missing');
+    for (let i = 0; i < 6; i += 1) {
+      await $.tool.call({ tool: 'Bash', command: `echo ${i}` });
+    }
+    expect(engine.engineCalls()).toBe(3);
+  });
+
+  test('WATERFALL keeps an in-process DLP warning when Model Armor finds nothing', async ($, on) => {
+    const { toasts } = registerBaseMocks(on, {
+      ARMORCEPT_MODE: 'WATERFALL',
+      ARMORCEPT_LOCAL_DLP_ACTION: 'warn',
+      GOOGLE_CLOUD_PROJECT: 'demo-sec-proj',
+      MODEL_ARMOR_TEMPLATE_ID: 'enterprise-armor',
+      GOOGLE_CLOUD_ACCESS_TOKEN: 'ya29.static_token',
+    });
+    failingEngine(on, 'crash');
+    on('http.fetch', () => ({
+      value: {
+        status: 200,
+        ok: true,
+        headers: {},
+        text: JSON.stringify({
+          sanitizationResult: { filterMatchState: 'NO_MATCH_FOUND', filterResults: {} },
+        }),
+      },
+    }));
+    const res = await $.tool.call({ tool: 'Bash', command: `echo ssn ${'123'}-45-6789` });
+    expect(res.deny).toBeUndefined();
+    expect(toasts.some((t) => t.includes('DLP_US_SSN'))).toBe(true);
+  });
+});
+
+describe('ArmorCept — Settings a repository may not weaken', () => {
+  const KEY = `AKIA${'P0O9I8U7Y6T5R4E3'}`;
+
+  function missingEngine(on: Parameters<typeof mock.env>[0]): void {
+    on('process.run', () => ({
+      value: { exitCode: 127, stdout: '', stderr: 'python3: not found', isStdoutTruncated: false, isStderrTruncated: false },
+    }));
+  }
+
+  test('audit mode set only by the repo is ignored and announced', async ($, on) => {
+    const { toasts } = registerBaseMocks(
+      on,
+      { ARMORCEPT_MODE: 'LOCAL', ARMORCEPT_ENFORCEMENT: 'audit', ARMORCEPT_FAIL_OPEN: 'true' },
+      {},
+      { project: { env: { ARMORCEPT_ENFORCEMENT: 'audit', ARMORCEPT_FAIL_OPEN: 'true' } } }
+    );
+    missingEngine(on);
+    on('session.start', ($, e) => e);
+    await $.session.start({ cwd: '/workspace', surface: null, isInteractive: false } as never);
+    expect(toasts.some((t) => t.includes('ignoring ARMORCEPT_ENFORCEMENT, ARMORCEPT_FAIL_OPEN'))).toBe(true);
+    const secret = await $.tool.call({ tool: 'Bash', command: `echo ${KEY}` });
+    expect(secret.deny).toContain('SECRET_LEAK_AWS_ACCESS_KEY');
+    // Fail-open was dropped too, so a clean call is blocked while the engine is down
+    const clean = await $.tool.call({ tool: 'Bash', command: 'ls' });
+    expect(clean.deny).toContain('ArmorCept engine unavailable (');
+  });
+
+  test('the same value in user settings, or a trust opt-in, keeps it', async ($, on) => {
+    registerBaseMocks(
+      on,
+      { ARMORCEPT_MODE: 'LOCAL', ARMORCEPT_ENFORCEMENT: 'audit' },
+      {},
+      {
+        project: { env: { ARMORCEPT_ENFORCEMENT: 'audit' } },
+        user: { env: { ARMORCEPT_ENFORCEMENT: 'audit' } },
+      }
+    );
+    missingEngine(on);
+    const secret = await $.tool.call({ tool: 'Bash', command: `echo ${KEY}` });
+    expect(secret.deny).toBeUndefined();
+  });
+
+  test('ARMORCEPT_TRUST_PROJECT_SETTINGS from user settings trusts the repo', async ($, on) => {
+    registerBaseMocks(
+      on,
+      { ARMORCEPT_MODE: 'LOCAL', ARMORCEPT_ENFORCEMENT: 'audit' },
+      {},
+      {
+        local: { env: { ARMORCEPT_ENFORCEMENT: 'audit' } },
+        user: { env: { ARMORCEPT_TRUST_PROJECT_SETTINGS: 'true' } },
+      }
+    );
+    missingEngine(on);
+    const secret = await $.tool.call({ tool: 'Bash', command: `echo ${KEY}` });
+    expect(secret.deny).toBeUndefined();
+  });
+
+  test('strengthening values from the repo still apply', async ($, on) => {
+    registerBaseMocks(
+      on,
+      { ARMORCEPT_MODE: 'LOCAL', ARMORCEPT_ENFORCEMENT: 'enforce', ARMORCEPT_LOCAL_DLP_ACTION: 'block' },
+      {},
+      { project: { env: { ARMORCEPT_ENFORCEMENT: 'enforce', ARMORCEPT_LOCAL_DLP_ACTION: 'block' } } }
+    );
+    missingEngine(on);
+    const secret = await $.tool.call({ tool: 'Bash', command: `echo ${KEY}` });
+    expect(secret.deny).toContain('SECRET_LEAK_AWS_ACCESS_KEY');
+  });
+
+  test('a config error from the engine blocks even in audit mode', async ($, on) => {
+    registerBaseMocks(on, { ARMORCEPT_MODE: 'LOCAL', ARMORCEPT_ENFORCEMENT: 'audit' });
+    on('process.run', () => ({
+      value: {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          decision: 'BLOCK',
+          risk_score: 1,
+          confidence: 1,
+          categories: ['ARMORCEPT_CONFIG_ERROR: entry 0: invalid regex'],
+          dlp_categories: [],
+        }),
+        stderr: '',
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    }));
+    const res = await $.tool.call({ tool: 'Bash', command: 'ls' });
+    expect(res.deny).toContain('ARMORCEPT_CONFIG_ERROR');
   });
 });

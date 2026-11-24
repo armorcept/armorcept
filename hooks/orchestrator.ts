@@ -359,12 +359,36 @@ async function logHealth(
   }
 }
 
+/**
+ * A failure of the machine rather than of one payload: the interpreter or the
+ * engine file is missing, or can't be run. Crashes, timeouts and malformed
+ * output can be caused by the input itself.
+ */
+export function isEnvironmentalFailure(reason: string): boolean {
+  return /exited 12[67]\b|ENOENT|EACCES|No such file|not found|command not found/i.test(reason);
+}
+
+/**
+ * Whether this failure may open the breaker. While the breaker is open the
+ * engine is skipped, which under fail-open means injection isn't scanned. So
+ * in fail-open LOCAL mode only environmental failures count, or input that
+ * crashes the engine three times would open a 30 s gap for everything after.
+ */
+function countsTowardBreaker(cfg: RuntimeConfig, reason: string): boolean {
+  if (cfg.failOpen && cfg.mode !== 'WATERFALL') {
+    return isEnvironmentalFailure(reason);
+  }
+  return true;
+}
+
 async function noteEngineFailure(
   $: EngineInterface,
   cfg: RuntimeConfig,
   reason: string
 ): Promise<void> {
-  consecutiveEngineFailures += 1;
+  if (countsTowardBreaker(cfg, reason)) {
+    consecutiveEngineFailures += 1;
+  }
   lastEngineFailure = reason;
   if (consecutiveEngineFailures >= BREAKER_THRESHOLD) {
     breakerOpenUntilMs = Date.now() + BREAKER_COOLDOWN_MS;
@@ -452,6 +476,14 @@ async function engineUnavailableVerdict(
 
   if (cfg.mode === 'WATERFALL') {
     const cloud = await runCloudPass($, text, cfg, true);
+    if (dlpVerdict && cloud.decision !== 'BLOCK') {
+      // Keep the in-process DLP warning; the cloud found nothing stronger
+      return {
+        ...dlpVerdict,
+        findings: [...dlpVerdict.findings, ...cloud.findings],
+        spans: [...(dlpVerdict.spans ?? []), ...(cloud.spans ?? [])],
+      };
+    }
     return { ...cloud, engineMode: 'ts-fallback', warning: unavailable };
   }
 

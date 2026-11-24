@@ -34,6 +34,10 @@ class DlpPattern:
     regex: "re.Pattern[str]"
     risk: float
     confidence: float
+    # False when a match doesn't cover the whole secret (the private-key
+    # pattern matches only the PEM header). Such matches get no span, so a
+    # tool result holding one is withheld whole, never redacted.
+    redactable: bool = True
 
 
 # Token bodies often end in "-" or "_", where \b does not hold, so the end of a
@@ -41,8 +45,12 @@ class DlpPattern:
 _TOKEN_END = r"(?![A-Za-z0-9_\-])"
 
 
-def _builtin(regex: str, category: str, risk: float, confidence: float) -> DlpPattern:
-    return DlpPattern(category, re.compile(regex), risk, confidence)
+def _builtin(
+    regex: str, category: str, risk: float, confidence: float, redactable: bool = True
+) -> DlpPattern:
+    # re.ASCII so \b, \d and \w mean what they mean in the TypeScript copy
+    # (hooks/dlp.ts) and the two can't disagree on non-ASCII neighbours.
+    return DlpPattern(category, re.compile(regex, re.ASCII), risk, confidence, redactable)
 
 
 BUILTIN_DLP_PATTERNS: List[DlpPattern] = [
@@ -83,6 +91,7 @@ BUILTIN_DLP_PATTERNS: List[DlpPattern] = [
         "SECRET_LEAK_PRIVATE_KEY",
         0.98,
         0.99,
+        redactable=False,
     ),
     _builtin(
         r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b", "DLP_US_SSN", 0.91, 0.93
@@ -105,6 +114,10 @@ def _to_utf16_offsets(text: str, spans: List[List[Any]]) -> List[List[Any]]:
 MAX_EXTRA_PATTERNS = 200
 MAX_EXTRA_REGEX_CHARS = 1000
 _EXTRA_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
+# A quantified group that itself holds a quantifier, such as (a+)+ or (\w*x)*:
+# the usual shape of catastrophic backtracking. Python's re has no timeout,
+# so these are refused up front. It is a heuristic, not a proof of safety.
+_NESTED_QUANTIFIER_RE = re.compile(r"\((?:[^()\\]|\\.)*(?<!\\)[+*}](?:[^()\\]|\\.)*\)[+*{]")
 
 
 class PatternConfigError(ValueError):
@@ -153,6 +166,10 @@ def load_extra_patterns(path: str) -> List[DlpPattern]:
             raise PatternConfigError(f"{label}: regex must be a non-empty string")
         if len(regex) > MAX_EXTRA_REGEX_CHARS:
             raise PatternConfigError(f"{label}: regex longer than {MAX_EXTRA_REGEX_CHARS} chars")
+        if _NESTED_QUANTIFIER_RE.search(regex):
+            raise PatternConfigError(
+                f"{label}: nested quantifier (e.g. (a+)+) can backtrack catastrophically"
+            )
         try:
             compiled = re.compile(regex)
         except re.error as exc:
@@ -164,7 +181,12 @@ def load_extra_patterns(path: str) -> List[DlpPattern]:
         for field, value in (("risk", risk), ("confidence", confidence)):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 1:
                 raise PatternConfigError(f"{label}: {field} must be a number in (0, 1]")
-        patterns.append(DlpPattern(f"CUSTOM_{name}", compiled, float(risk), float(confidence)))
+        redactable = entry.get("redactable", False)
+        if not isinstance(redactable, bool):
+            raise PatternConfigError(f"{label}: redactable must be true or false")
+        patterns.append(
+            DlpPattern(f"CUSTOM_{name}", compiled, float(risk), float(confidence), redactable)
+        )
     return patterns
 
 
@@ -273,6 +295,8 @@ class WarmPromptArmorEngine:
         """
         spans: List[List[Any]] = []
         for pattern in self.dlp_patterns:
+            if not pattern.redactable:
+                continue
             for m in pattern.regex.finditer(text):
                 if m.end() > m.start():
                     spans.append([pattern.category, m.start(), m.end()])
